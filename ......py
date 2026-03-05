@@ -361,10 +361,14 @@ def handle_terminate(data):
     for bot_id, _ in targets:
         terminate_flags[bot_id] = True
 
-    try:
-        if _bot_loop and _bot_loop.is_running():
-            asyncio.run_coroutine_threadsafe(_unblock_sync(), _bot_loop)
-    except: pass
+    # Only unblock sync if ALL bots of a meeting are being terminated
+    all_meeting_bots = [bid for bid, b in list(running_bots.items())
+                        if meeting_id == 'all' or str(b.get('meeting_id','')).replace(' ','') == meeting_id]
+    if len(all_meeting_bots) == killed:
+        try:
+            if _bot_loop and _bot_loop.is_running():
+                asyncio.run_coroutine_threadsafe(_unblock_sync(), _bot_loop)
+        except: pass
 
     def cleanup():
         global current_bots
@@ -382,23 +386,27 @@ def handle_terminate(data):
 
         time.sleep(1)
 
-        running_bots.clear()
-        terminate_flags.clear()
+        # Sirf targeted bots remove karo — baaki chalne do
+        target_ids = [bid for bid, _ in targets]
+        for bid in target_ids:
+            running_bots.pop(bid, None)
+            terminate_flags.pop(bid, None)
         with bot_lock:
-            current_bots = 0
+            current_bots = max(0, current_bots - killed)
 
-        try: os.system("pkill -9 -f chromium 2>/dev/null; pkill -9 -f chrome 2>/dev/null")
-        except: pass
-        try: os.system("rm -rf /tmp/.org.chromium.* /tmp/playwright* 2>/dev/null")
-        except: pass
-        gc.collect()
+        # Agar sab kill ho gaye tab hi chromium processes kill karo
+        if len(running_bots) == 0:
+            try: os.system("pkill -9 -f chromium 2>/dev/null; pkill -9 -f chrome 2>/dev/null")
+            except: pass
+            try: os.system("rm -rf /tmp/.org.chromium.* /tmp/playwright* 2>/dev/null")
+            except: pass
         gc.collect()
 
-        sync_print(f"Freed {killed} | READY")
+        sync_print(f"Freed {killed} | active={len(running_bots)} | READY")
         try:
             sio.emit('terminateAck', {'instanceId': INSTANCE_ID, 'killed': killed})
             sio.emit('instanceUpdate', {'instanceId': INSTANCE_ID,
-                                        'currentUsers': 0, 'maxUsers': MAX_USERS_PER_INSTANCE})
+                                        'currentUsers': current_bots, 'maxUsers': MAX_USERS_PER_INSTANCE})
         except: pass
 
     threading.Thread(target=cleanup, daemon=True).start()
@@ -436,7 +444,7 @@ def handle_command(data):
         BOTS_FAILED   = 0
         READY_TO_JOIN = asyncio.Event()
         PAGE_LOAD_SEM = asyncio.Semaphore(2)
-        terminate_flags.clear()
+        # Don't clear ALL flags — other meetings may be running
 
         tasks = [
             loop.create_task(

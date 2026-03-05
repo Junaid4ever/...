@@ -207,7 +207,7 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
         )
 
         if bot_id:
-            running_bots[bot_id] = {'browser': browser, 'meeting_id': meetingcode}
+            running_bots[bot_id] = {'browser': browser, 'meeting_id': str(meetingcode).replace(' ','')}
 
         context = await browser.new_context(permissions=[], viewport={"width": 1280, "height": 720})
         page    = await context.new_page()
@@ -348,11 +348,12 @@ def handle_terminate(data):
     global current_bots
 
     meeting_id = data.get('meetingId') if isinstance(data, dict) else data
+    if meeting_id: meeting_id = str(meeting_id).replace(' ', '')
     if meeting_id in ('all', None, ''):
         targets = list(running_bots.items())
     else:
         targets = [(bid, b) for bid, b in list(running_bots.items())
-                   if b.get('meeting_id') == meeting_id]
+                   if str(b.get('meeting_id','')).replace(' ','') == meeting_id]
 
     killed = len(targets)
     sync_print(f"Terminating {killed} bots...")

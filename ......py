@@ -23,7 +23,7 @@ _parser = _ap.ArgumentParser()
 _parser.add_argument('--server', type=str, default="https://extensional-christene-intensionally.ngrok-free.dev")
 _args, _ = _parser.parse_known_args()
 NGROK_URL = _args.server
-INSTANCE_ID = f"colab-{random.randint(1000, 9999)}"
+INSTANCE_ID = f"colab-{int(time.time()*1000)%100000}"
 MAX_USERS_PER_INSTANCE = 10
 current_bots = 0
 bot_lock = threading.Lock()
@@ -40,6 +40,10 @@ MUTEX = threading.Lock()
 def sync_print(msg):
     with MUTEX:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+    try:
+        sio.emit('botLog', {'instanceId': INSTANCE_ID, 'msg': msg,
+                            'ts': datetime.now().strftime('%H:%M:%S')})
+    except: pass
 
 # ========== NAME ==========
 def get_name(mode="indian", custom_list=None, index=0):

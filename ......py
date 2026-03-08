@@ -522,9 +522,11 @@ except Exception as e:
 while True:
     time.sleep(1)
     if _SHOULD_UNASSIGN:
+        # Write a trigger file that Cell 3 watches
         try:
-            from google.colab import runtime
-            runtime.unassign()
+            with open('/content/unassign_trigger.txt', 'w') as f:
+                f.write('1')
+            sync_print("Unassign trigger written — waiting for cell to pick up...")
         except Exception as e:
-            sync_print(f"Unassign error: {e}")
-            os._exit(0)
+            sync_print(f"Trigger write error: {e}")
+        break  # Exit main loop so cell finishes and next cell can run

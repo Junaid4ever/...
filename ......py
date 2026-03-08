@@ -496,6 +496,15 @@ def connect():
 def disconnect():
     sync_print("Disconnected")
 
+@sio.on('shutdown')
+def handle_shutdown(_=None):
+    sync_print("Shutdown signal received — unassigning Colab runtime...")
+    try:
+        from google.colab import runtime
+        runtime.unassign()
+    except Exception as e:
+        sync_print(f"Shutdown error: {e}")
+
 @sio.on('getInstances')
 def on_get_instances(_=None):
     try:

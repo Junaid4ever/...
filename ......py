@@ -30,7 +30,7 @@ bot_lock = threading.Lock()
 running_bots = {}
 terminate_flags = {}
 _bot_loop = None
-PAGE_LOAD_SEM = None  # set in run_automation
+PAGE_LOAD_SEM = None
 
 print(f"[{datetime.now().strftime('%H:%M:%S')}] ID={INSTANCE_ID} | Max={MAX_USERS_PER_INSTANCE}")
 
@@ -84,7 +84,7 @@ async def wait_for_all_bots():
 async def _unblock_sync():
     READY_TO_JOIN.set()
 
-# ========== AUDIO / WAIT HELPERS — ORIGINAL ==========
+# ========== AUDIO / WAIT HELPERS ==========
 async def join_audio_computer(page, tag):
     try:
         for selector in [
@@ -183,7 +183,6 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
     def stop():
         return bot_id and terminate_flags.get(bot_id, False)
 
-    # Semaphore: max 2 bots loading page at once
     await PAGE_LOAD_SEM.acquire()
 
     browser = None
@@ -220,7 +219,7 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
         await page.goto(zoom_url, timeout=120000)
         await page.wait_for_timeout(4000)
 
-        # ── NAME INPUT — exact original ──
+        # NAME INPUT
         try:
             name_input = page.locator('xpath=//*[@id="input-for-name"]')
             await name_input.wait_for(state="visible", timeout=30000)
@@ -239,13 +238,12 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
             terminate_flags.pop(bot_id, None)
             return
 
-        # Release semaphore after name filled — next bot can now load
         PAGE_LOAD_SEM.release()
         sem_released = True
 
         if stop(): raise Exception("TERMINATED")
 
-        # ── PASSCODE — exact original ──
+        # PASSCODE
         if passcode is not None and passcode != "":
             sync_print(f"{tag} attempting to enter passcode: {passcode}")
             try:
@@ -277,11 +275,11 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
         else:
             sync_print(f"{tag} no passcode provided (empty), skipping passcode field")
 
-        # ── SYNC BARRIER ──
+        # SYNC BARRIER
         await wait_for_all_bots()
         if stop(): raise Exception("TERMINATED")
 
-        # ── JOIN BUTTON — exact original selectors + click ──
+        # JOIN BUTTON
         try:
             join_selectors = [
                 'xpath=//button[contains(text(), "Join")]',
@@ -314,7 +312,6 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
             except: pass
             return
 
-        # ── WAIT / AUDIO — exact original ──
         await wait_for_meeting_to_start(page, tag)
         await wait_for_waiting_room(page, tag)
         await join_audio_computer(page, tag)
@@ -365,7 +362,6 @@ def handle_terminate(data):
     for bot_id, _ in targets:
         terminate_flags[bot_id] = True
 
-    # Only unblock sync if ALL bots of a meeting are being terminated
     all_meeting_bots = [bid for bid, b in list(running_bots.items())
                         if meeting_id == 'all' or str(b.get('meeting_id','')).replace(' ','') == meeting_id]
     if len(all_meeting_bots) == killed:
@@ -390,7 +386,6 @@ def handle_terminate(data):
 
         time.sleep(1)
 
-        # Sirf targeted bots remove karo — baaki chalne do
         target_ids = [bid for bid, _ in targets]
         for bid in target_ids:
             running_bots.pop(bid, None)
@@ -398,7 +393,6 @@ def handle_terminate(data):
         with bot_lock:
             current_bots = max(0, current_bots - killed)
 
-        # Agar sab kill ho gaye tab hi chromium processes kill karo
         if len(running_bots) == 0:
             try: os.system("pkill -9 -f chromium 2>/dev/null; pkill -9 -f chrome 2>/dev/null")
             except: pass
@@ -410,7 +404,8 @@ def handle_terminate(data):
         try:
             sio.emit('terminateAck', {'instanceId': INSTANCE_ID, 'killed': killed})
             sio.emit('instanceUpdate', {'instanceId': INSTANCE_ID,
-                                        'currentUsers': current_bots, 'maxUsers': MAX_USERS_PER_INSTANCE})
+                                        'currentUsers': current_bots,
+                                        'maxUsers': MAX_USERS_PER_INSTANCE})
         except: pass
 
     threading.Thread(target=cleanup, daemon=True).start()
@@ -448,7 +443,6 @@ def handle_command(data):
         BOTS_FAILED   = 0
         READY_TO_JOIN = asyncio.Event()
         PAGE_LOAD_SEM = asyncio.Semaphore(2)
-        # Don't clear ALL flags — other meetings may be running
 
         tasks = [
             loop.create_task(
@@ -483,7 +477,19 @@ def handle_command(data):
         else:
             sync_print(f"Capacity full ({current_bots}/{MAX_USERS_PER_INSTANCE})")
 
-# ========== SOCKET ==========
+# ========== SOCKET EVENTS ==========
+@sio.on('doUnassign')
+def handle_unassign(data=None):
+    sync_print("Server shutdown signal — unassigning Colab...")
+    def _do():
+        time.sleep(1)
+        try:
+            from google.colab import runtime
+            runtime.unassign()
+        except Exception as e:
+            sync_print(f"Unassign error: {e}")
+    threading.Thread(target=_do, daemon=True).start()
+
 @sio.event
 def connect():
     sync_print("Connected to server")

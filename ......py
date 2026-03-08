@@ -478,22 +478,13 @@ def handle_command(data):
             sync_print(f"Capacity full ({current_bots}/{MAX_USERS_PER_INSTANCE})")
 
 # ========== SOCKET EVENTS ==========
+_SHOULD_UNASSIGN = False
+
 @sio.on('doUnassign')
 def handle_unassign(data=None):
+    global _SHOULD_UNASSIGN
     sync_print("Server shutdown signal — unassigning Colab...")
-    def _do():
-        time.sleep(2)
-        try:
-            # Must run in main thread context for Colab kernel access
-            import ctypes
-            ctypes.pythonapi.PyThreadState_SetAsyncExc(
-                ctypes.c_ulong(threading.main_thread().ident),
-                ctypes.py_object(SystemExit)
-            )
-        except Exception as e:
-            sync_print(f"Unassign error: {e}")
-            os._exit(0)
-    threading.Thread(target=_do, daemon=True).start()
+    _SHOULD_UNASSIGN = True
 
 @sio.event
 def connect():
@@ -530,3 +521,10 @@ except Exception as e:
 
 while True:
     time.sleep(1)
+    if _SHOULD_UNASSIGN:
+        try:
+            from google.colab import runtime
+            runtime.unassign()
+        except Exception as e:
+            sync_print(f"Unassign error: {e}")
+            os._exit(0)

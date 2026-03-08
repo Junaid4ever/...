@@ -482,12 +482,17 @@ def handle_command(data):
 def handle_unassign(data=None):
     sync_print("Server shutdown signal — unassigning Colab...")
     def _do():
-        time.sleep(1)
+        time.sleep(2)
         try:
-            from google.colab import runtime
-            runtime.unassign()
+            # Must run in main thread context for Colab kernel access
+            import ctypes
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_ulong(threading.main_thread().ident),
+                ctypes.py_object(SystemExit)
+            )
         except Exception as e:
             sync_print(f"Unassign error: {e}")
+            os._exit(0)
     threading.Thread(target=_do, daemon=True).start()
 
 @sio.event

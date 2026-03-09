@@ -41,7 +41,13 @@ def sync_print(msg):
     with MUTEX:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
     try:
-        sio.emit('botLog', {'instanceId': INSTANCE_ID, 'msg': msg,
+        # Skip noisy system messages
+        msg_str = str(msg)
+        skip_keywords = ['--disable', '--enable', 'chromium', 'libatk', 'shared lib',
+                         'temporary dir', 'pid=', 'chrome-headless']
+        if any(k in msg_str.lower() for k in skip_keywords): return
+        short = msg_str[:300] if len(msg_str) > 300 else msg_str
+        sio.emit('botLog', {'instanceId': INSTANCE_ID, 'msg': short,
                             'ts': datetime.now().strftime('%H:%M:%S')})
     except: pass
 
@@ -500,8 +506,15 @@ def disconnect():
 def handle_shutdown(_=None):
     sync_print("Shutdown signal received — unassigning Colab runtime...")
     try:
-        from google.colab import runtime
-        runtime.unassign()
+        # Write trigger file — Cell 3 watcher picks it up
+        with open('/content/SHUTDOWN_NOW', 'w') as f:
+            f.write('1')
+        sync_print("Shutdown trigger written")
+        # Also try direct call
+        try:
+            from google.colab import runtime
+            runtime.unassign()
+        except: pass
     except Exception as e:
         sync_print(f"Shutdown error: {e}")
 

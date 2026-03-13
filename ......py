@@ -32,6 +32,14 @@ terminate_flags = {}
 _bot_loop = None
 PAGE_LOAD_SEM = None
 
+# PRE-WARM STATE
+prewarm_bots   = {}
+prewarm_lock   = threading.Lock()
+prewarm_loop   = None
+PREWARM_ACTIVE = False
+_join_event    = {}
+_join_data     = {}
+
 print(f"[{datetime.now().strftime('%H:%M:%S')}] ID={INSTANCE_ID} | Max={MAX_USERS_PER_INSTANCE}")
 
 sio = socketio.Client(reconnection=True)
@@ -222,13 +230,13 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
         page    = await context.new_page()
 
         zoom_url = get_zoom_url(meetingcode)
-        await page.goto(zoom_url, timeout=120000)
-        await page.wait_for_timeout(4000)
+        await page.goto(zoom_url, timeout=60000)
+        await page.wait_for_timeout(1500)  # reduced: page settles faster
 
         # NAME INPUT
         try:
             name_input = page.locator('xpath=//*[@id="input-for-name"]')
-            await name_input.wait_for(state="visible", timeout=30000)
+            await name_input.wait_for(state="visible", timeout=15000)
             await asyncio.sleep(1)
             user_name = get_name(name_mode, custom_names, bot_index)
             await name_input.fill(user_name)
@@ -271,7 +279,7 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
                     except:
                         continue
                 if pass_input:
-                    await asyncio.sleep(1.5)
+                    await asyncio.sleep(0.5)
                     await pass_input.fill(passcode)
                     sync_print(f"{tag} passcode filled: {passcode}")
                 else:
@@ -417,6 +425,123 @@ def handle_terminate(data):
     threading.Thread(target=cleanup, daemon=True).start()
 
 # ========== COMMAND ==========
+async def _prewarm_slot(slot_idx, name_mode, custom_names):
+    global PREWARM_ACTIVE
+    tag = f"[{INSTANCE_ID}-pw{slot_idx+1:02d}]"
+    try:
+        p_inst = async_playwright()
+        p = await p_inst.__aenter__()
+        browser = await p.chromium.launch(
+            headless=True,
+            args=['--no-sandbox','--disable-dev-shm-usage',
+                  '--use-fake-device-for-media-stream',
+                  '--use-file-for-fake-audio-capture=/dev/null',
+                  '--mute-audio','--disable-camera','--disable-video-capture',
+                  '--disable-gpu','--window-size=1280,720']
+        )
+        context = await browser.new_context(permissions=[], viewport={"width":1280,"height":720})
+        page    = await context.new_page()
+        name    = get_name(name_mode, custom_names, slot_idx)
+
+        with prewarm_lock:
+            prewarm_bots[slot_idx] = {
+                'page': page, 'browser': browser,
+                'context': context, 'p_inst': p_inst,
+                'name': name, 'ready': True
+            }
+
+        sync_print(f"{tag} pre-warmed name={name}")
+
+        evt = asyncio.Event()
+        _join_event[slot_idx] = evt
+        await evt.wait()
+
+        if not PREWARM_ACTIVE:
+            await browser.close(); return
+
+        jdata        = _join_data.get(slot_idx, {})
+        meeting_code = jdata.get('meetingCode', '')
+        passcode     = str(jdata.get('passcode', '') or '').strip()
+        duration     = jdata.get('duration', 90)
+
+        zoom_url = get_zoom_url(meeting_code)
+        await page.goto(zoom_url, timeout=60000)
+        await page.wait_for_timeout(1500)
+
+        try:
+            ni = page.locator('xpath=//*[@id="input-for-name"]')
+            await ni.wait_for(state="visible", timeout=10000)
+            await ni.fill(name)
+            sync_print(f"{tag} name filled: {name}")
+        except: pass
+
+        if passcode:
+            for sel in ['xpath=//input[@type="password"]','xpath=//*[@id="input-for-password"]']:
+                try:
+                    pi = page.locator(sel)
+                    if await pi.count() > 0:
+                        await pi.first.wait_for(state="visible", timeout=4000)
+                        await asyncio.sleep(0.5)
+                        await pi.first.fill(passcode)
+                        sync_print(f"{tag} passcode filled")
+                        break
+                except: continue
+
+        for sel in ['xpath=//button[contains(text(), "Join")]',
+                    'xpath=//button[contains(@class, "join")]',
+                    'xpath=//*[@id="root"]/div/div[1]/div/div[2]/button']:
+            try:
+                btn = page.locator(sel)
+                if await btn.count() > 0:
+                    await btn.first.wait_for(state="visible", timeout=4000)
+                    await btn.first.click()
+                    sync_print(f"{tag} join clicked")
+                    break
+            except: continue
+
+        await wait_for_meeting_to_start(page, tag, duration*60)
+        await wait_for_waiting_room(page, tag, duration*60)
+        await join_audio_computer(page, tag)
+        sync_print(f"{tag} in meeting — staying {duration} min")
+
+        end_time = asyncio.get_event_loop().time() + duration * 60
+        while asyncio.get_event_loop().time() < end_time:
+            await asyncio.sleep(2)
+            if terminate_flags.get(f"pw{slot_idx}"): break
+
+        sync_print(f"{tag} done")
+    except Exception as e:
+        sync_print(f"{tag} error: {e}")
+    finally:
+        try: await browser.close()
+        except: pass
+        with prewarm_lock:
+            prewarm_bots.pop(slot_idx, None)
+
+
+def start_prewarm(n_slots, name_mode='indian', custom_names=None):
+    global prewarm_loop, PREWARM_ACTIVE
+    if PREWARM_ACTIVE:
+        sync_print("Pre-warm already running"); return
+    PREWARM_ACTIVE = True
+    _join_event.clear()
+    _join_data.clear()
+
+    def _run():
+        global prewarm_loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        prewarm_loop = loop
+        tasks = [loop.create_task(_prewarm_slot(i, name_mode, custom_names)) for i in range(n_slots)]
+        loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+        try: loop.close()
+        except: pass
+        sync_print("Pre-warm batch ended")
+
+    threading.Thread(target=_run, daemon=True).start()
+    sync_print(f"Pre-warming {n_slots} bots...")
+
+
 @sio.on(f'command_{INSTANCE_ID}')
 def handle_command(data):
     global current_bots, BOTS_TOTAL, BOTS_READY, BOTS_FAILED, READY_TO_JOIN, _bot_loop, PAGE_LOAD_SEM
@@ -437,6 +562,23 @@ def handle_command(data):
 
     sync_print(f"Starting {users} bots | meeting={meeting_code} | mode={name_mode}")
 
+    # USE PRE-WARMED BOTS IF AVAILABLE
+    with prewarm_lock:
+        ready_slots = sorted([idx for idx, b in prewarm_bots.items() if b.get('ready')])
+
+    if ready_slots and PREWARM_ACTIVE and prewarm_loop and not prewarm_loop.is_closed():
+        use_slots = ready_slots[:users]
+        sync_print(f"Using {len(use_slots)} pre-warmed bots — instant join!")
+        for idx in use_slots:
+            _join_data[idx] = {'meetingCode': meeting_code, 'passcode': passcode, 'duration': duration}
+            evt = _join_event.get(idx)
+            if evt:
+                prewarm_loop.call_soon_threadsafe(evt.set)
+        users = users - len(use_slots)
+        if users <= 0:
+            return
+        sync_print(f"{users} extra bots launching normally...")
+
     def run_automation():
         global BOTS_TOTAL, BOTS_READY, BOTS_FAILED, READY_TO_JOIN, _bot_loop, current_bots, PAGE_LOAD_SEM
 
@@ -448,7 +590,7 @@ def handle_command(data):
         BOTS_READY    = 0
         BOTS_FAILED   = 0
         READY_TO_JOIN = asyncio.Event()
-        PAGE_LOAD_SEM = asyncio.Semaphore(2)
+        PAGE_LOAD_SEM = asyncio.Semaphore(10)  # all bots load in parallel
 
         tasks = [
             loop.create_task(
@@ -482,6 +624,14 @@ def handle_command(data):
             threading.Thread(target=run_automation, daemon=True).start()
         else:
             sync_print(f"Capacity full ({current_bots}/{MAX_USERS_PER_INSTANCE})")
+
+@sio.on(f'prewarm_{INSTANCE_ID}')
+def handle_prewarm(data):
+    n     = data.get('users', MAX_USERS_PER_INSTANCE)
+    nmode = data.get('nameMode', 'indian')
+    cnames= data.get('customNames', None)
+    sync_print(f"Pre-warm: {n} slots, mode={nmode}")
+    start_prewarm(n, nmode, cnames)
 
 # ========== SOCKET EVENTS ==========
 _SHOULD_UNASSIGN = False

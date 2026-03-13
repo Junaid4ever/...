@@ -542,9 +542,9 @@ async def _pw_slot(slot_idx):
             sync_print(f"{tag} join error: {e}")
         if stop(): return
 
-        await wait_for_meeting_to_start(page, tag, duration*60)
+        await wait_for_meeting_to_start(page, tag)
         if stop(): return
-        await wait_for_waiting_room(page, tag, duration*60)
+        await wait_for_waiting_room(page, tag)
         if stop(): return
         await join_audio_computer(page, tag)
         sync_print(f"{tag} now staying for {duration} minutes")

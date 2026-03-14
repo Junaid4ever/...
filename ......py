@@ -47,29 +47,29 @@ ZOOM_PARTS = {
 def get_zoom_url(mc):
     return f"https://{ZOOM_PARTS['domain']}/{ZOOM_PARTS['join_path']}/{mc}"
 
-# ── Audio: try 3 times, no sleep between attempts ──
+# ── Audio: wait for button to appear then click immediately ──
 async def join_audio(page):
-    for attempt in range(3):
-        try:
-            # JS click — fastest
-            result = await page.evaluate("""() => {
-                const sels = [
-                    'button.join-audio-by-voip__join-btn',
-                    'button[class*="join-audio"]',
-                ];
-                for(const s of sels){
-                    const b = document.querySelector(s);
-                    if(b){b.click();return 'clicked:'+s;}
-                }
-                const btns = [...document.querySelectorAll('button')];
-                const b = btns.find(b=>b.textContent.match(/Join Audio|Computer Audio|Microphone/i) && !b.disabled);
-                if(b){b.click();return 'clicked:text';}
-                return null;
-            }""")
-            if result:
-                return True
-        except: pass
-        await asyncio.sleep(0.5)
+    # All known selectors Zoom uses for the audio join button
+    selectors = [
+        'xpath=//button[contains(@class,"join-audio-by-voip__join-btn")]',
+        'xpath=//button[contains(@class,"join-audio-container")]',
+        'css=button.join-audio-by-voip__join-btn',
+        'xpath=//button[contains(text(),"Join Audio")]',
+        'xpath=//button[contains(text(),"Computer Audio")]',
+        'xpath=//button[contains(text(),"Microphone")]',
+        'css=button[aria-label*="Join Audio"]',
+        'css=button[aria-label*="join audio"]',
+    ]
+    # Wait up to 15 seconds total for button to appear, then click immediately
+    for attempt in range(15):
+        for sel in selectors:
+            try:
+                b = page.locator(sel)
+                if await b.count() > 0:
+                    await b.first.click()
+                    return True
+            except: continue
+        await asyncio.sleep(1)
     return False
 
 async def wait_meeting_start(page):
@@ -113,9 +113,10 @@ async def _pool_slot(slot_idx):
                 '--no-sandbox','--disable-dev-shm-usage',
                 '--use-fake-device-for-media-stream',
                 '--use-file-for-fake-audio-capture=/dev/null',
-                '--mute-audio','--disable-camera','--disable-video-capture',
+                '--disable-camera','--disable-video-capture',
                 '--disable-gpu','--window-size=1280,720',
                 '--autoplay-policy=no-user-gesture-required',
+                '--allow-running-insecure-content',
             ]
         )
         # Grant microphone permission up front
@@ -202,11 +203,10 @@ async def _pool_slot(slot_idx):
         await wait_waiting_room(page)
         if stop(): return
 
-        # Audio — try immediately, retry if needed
-        for _ in range(3):
-            ok = await join_audio(page)
-            if ok: break
-            await asyncio.sleep(1)
+        # Small wait for Zoom meeting UI to fully render
+        await asyncio.sleep(1.5)
+        # Audio — join immediately when button appears
+        await join_audio(page)
 
         log(f"{tag} IN MEETING")
 

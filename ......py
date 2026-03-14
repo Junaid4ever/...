@@ -22,6 +22,12 @@ bot_lock = threading.Lock()
 running_bots = {}
 terminate_flags = {}
 
+# Sync barrier — all bots wait here before joining together
+_sync_event = None
+_sync_lock  = threading.Lock()
+_sync_count = 0
+_sync_total = 0
+
 # Only print these 3 things — nothing else
 def log(msg):
     with _MUTEX:
@@ -91,6 +97,32 @@ async def wait_waiting_room(page):
                 if await page.locator('xpath=//button[contains(@aria-label,"mute")]').count() > 0: break
                 await asyncio.sleep(1)
     except: pass
+
+# ── Sync barrier context manager ──
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def _sync_barrier():
+    global _sync_count, _sync_total, _sync_event
+    with _sync_lock:
+        _sync_count += 1
+        cnt = _sync_count
+        tot = _sync_total
+    if cnt >= tot:
+        # Last bot arrived — release all
+        if _sync_event:
+            _sync_event.set()
+    else:
+        # Wait for others
+        if _sync_event:
+            await _sync_event.wait()
+    yield
+
+def _reset_sync(total):
+    global _sync_count, _sync_total, _sync_event
+    _sync_count = 0
+    _sync_total = total
+    _sync_event = asyncio.Event()
 
 # ========== POOL ==========
 _pool       = {}
@@ -180,21 +212,33 @@ async def _pool_slot(slot_idx):
             except: pass
         if stop(): return
 
-        # Join
-        try:
-            join_btn = None
+        # Find join button (but don't click yet)
+        join_btn = None
+        for attempt in range(15):
             for sel in ['xpath=//button[contains(text(),"Join")]',
                         'xpath=//button[contains(@class,"join")]',
                         'xpath=//*[@id="root"]/div/div[1]/div/div[2]/button']:
                 try:
                     jb = page.locator(sel)
                     if await jb.count() > 0:
-                        await jb.first.wait_for(state="visible", timeout=5000)
+                        await jb.first.wait_for(state="visible", timeout=3000)
                         join_btn = jb.first; break
                 except: continue
-            if join_btn:
-                await join_btn.click()
-            else: return
+            if join_btn: break
+            await asyncio.sleep(1)
+
+        if not join_btn: return
+        if stop(): return
+
+        # ── SYNC BARRIER: wait for all bots to reach join button ──
+        async with _sync_barrier():
+            pass  # all bots release together
+
+        if stop(): return
+
+        # All bots click simultaneously
+        try:
+            await join_btn.click()
         except: return
         if stop(): return
 
@@ -271,7 +315,9 @@ def handle_command(data):
         _cmd_data[idx] = {'meetingCode': meeting_code, 'passcode': passcode,
                           'nameMode': name_mode, 'customNames': custom_names, 'duration': duration}
 
+    # Reset sync barrier for this batch
     if _pool_loop and not _pool_loop.is_closed():
+        _pool_loop.call_soon_threadsafe(_reset_sync, len(use_slots))
         for idx in use_slots:
             evt = _cmd_events.get(idx)
             if evt: _pool_loop.call_soon_threadsafe(evt.set)

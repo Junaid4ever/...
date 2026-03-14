@@ -21,8 +21,6 @@ current_bots = 0
 bot_lock = threading.Lock()
 running_bots = {}
 terminate_flags = {}
-_bot_loop = None
-PAGE_LOAD_SEM = None
 
 print(f"[{datetime.now().strftime('%H:%M:%S')}] ID={INSTANCE_ID} | Max={MAX_USERS_PER_INSTANCE}")
 
@@ -53,29 +51,6 @@ ZOOM_PARTS = {
 }
 def get_zoom_url(mc):
     return f"https://{ZOOM_PARTS['domain']}/{ZOOM_PARTS['join_path']}/{mc}"
-
-# ========== SYNC BARRIER ==========
-READY_TO_JOIN = asyncio.Event()
-BOTS_READY = 0
-BOTS_TOTAL = 0
-BOTS_FAILED = 0
-BOTS_LOCK = asyncio.Lock()
-
-async def wait_for_all_bots():
-    global BOTS_READY, BOTS_TOTAL
-    async with BOTS_LOCK:
-        BOTS_READY += 1
-        ready = BOTS_READY
-        total = BOTS_TOTAL
-        failed = BOTS_FAILED
-    sync_print(f"[SYNC] {ready}/{total} ready (failed:{failed})")
-    if ready + failed >= total:
-        READY_TO_JOIN.set()
-        sync_print("[SYNC] All ready! Joining together...")
-    await READY_TO_JOIN.wait()
-
-async def _unblock_sync():
-    READY_TO_JOIN.set()
 
 # ========== HELPERS ==========
 async def join_audio_computer(page, tag):
@@ -136,23 +111,20 @@ async def wait_for_waiting_room(page, tag):
     except: pass
     return True
 
-# ========== PRE-LOAD POOL ==========
-# Each slot: browser pre-opened, waits for preload command (meeting URL + naam fill)
-# Then waits for launch command (just clicks join)
+# ========== BLANK BROWSER POOL ==========
+# On connect: MAX_USERS_PER_INSTANCE blank browsers open silently.
+# On command: each slot navigates to zoom URL, fills name, joins — all simultaneously.
 
-_pool = {}        # slot_idx -> {browser, context, page, name, state}
-                  # state: 'idle' | 'loading' | 'ready' | 'joining' | 'in_meeting'
-_pool_lock = threading.Lock()
-_pool_loop = None
-_preload_events = {}   # slot_idx -> asyncio.Event (signals preload data arrived)
-_launch_events  = {}   # slot_idx -> asyncio.Event (signals launch)
-_preload_data   = {}   # slot_idx -> {meetingCode, passcode, nameMode, customNames, duration}
-_POOL_SIZE = MAX_USERS_PER_INSTANCE
+_pool       = {}   # slot_idx -> {browser, context, page, state, bot_id}
+_pool_lock  = threading.Lock()
+_pool_loop  = None
+_cmd_events = {}   # slot_idx -> asyncio.Event  (fires when command arrives)
+_cmd_data   = {}   # slot_idx -> {meetingCode, passcode, nameMode, customNames, duration}
 
 async def _pool_slot(slot_idx):
-    """One browser window — lives until terminate/shutdown."""
-    tag = f"[{INSTANCE_ID}-{slot_idx+1:02d}]"
-    bot_id = f"pw-{INSTANCE_ID}-{slot_idx+1:02d}"
+    """One blank browser — sits idle until a command fires it."""
+    tag    = f"[{INSTANCE_ID}-{slot_idx+1:02d}]"
+    bot_id = f"{INSTANCE_ID}-{slot_idx+1:02d}"
     browser = None
 
     try:
@@ -170,93 +142,79 @@ async def _pool_slot(slot_idx):
         page    = await context.new_page()
 
         with _pool_lock:
-            _pool[slot_idx] = {'browser': browser, 'context': context,
-                               'page': page, 'state': 'idle', 'bot_id': bot_id}
+            _pool[slot_idx] = {
+                'browser': browser, 'context': context,
+                'page': page, 'state': 'idle', 'bot_id': bot_id
+            }
 
-        sync_print(f"{tag} window open — waiting for pre-load")
+        sync_print(f"{tag} window open — idle")
 
-        # Wait for preload signal (meeting URL + naam fill)
-        preload_evt = asyncio.Event()
-        _preload_events[slot_idx] = preload_evt
-        await preload_evt.wait()
+        # Wait for command
+        cmd_evt = asyncio.Event()
+        _cmd_events[slot_idx] = cmd_evt
+        await cmd_evt.wait()
 
-        # Check if terminated during wait
+        # Check terminate
         if terminate_flags.get(bot_id):
             return
 
-        data = _preload_data.get(slot_idx, {})
+        data         = _cmd_data.get(slot_idx, {})
         meeting_code = data.get('meetingCode', '')
         passcode     = str(data.get('passcode', '') or '').strip()
         name_mode    = data.get('nameMode', 'indian')
         custom_names = data.get('customNames', None)
         duration     = data.get('duration', 90)
 
-        with _pool_lock:
-            if slot_idx in _pool:
-                _pool[slot_idx]['state'] = 'loading'
+        if not meeting_code:
+            sync_print(f"{tag} no meeting code"); return
 
-        # Navigate to meeting URL
-        sync_print(f"{tag} pre-loading: {meeting_code}")
+        terminate_flags[bot_id] = False
+        running_bots[bot_id] = {'browser': browser,
+                                 'meeting_id': str(meeting_code).replace(' ','')}
+
+        with _pool_lock:
+            if slot_idx in _pool: _pool[slot_idx]['state'] = 'loading'
+
+        def stop():
+            return terminate_flags.get(bot_id, False)
+
+        # ── Navigate (all slots fire simultaneously) ──
+        sync_print(f"{tag} navigating → {meeting_code}")
         await page.goto(get_zoom_url(meeting_code), timeout=120000)
         await page.wait_for_timeout(3000)
+        if stop(): return
 
-        if terminate_flags.get(bot_id): return
-
-        # Fill name
+        # ── Fill name ──
         name = get_name(name_mode, custom_names, slot_idx)
         try:
             ni = page.locator('xpath=//*[@id="input-for-name"]')
             await ni.wait_for(state="visible", timeout=30000)
             await asyncio.sleep(0.5)
             await ni.fill(name)
-            sync_print(f"{tag} pre-loaded: name={name}")
+            sync_print(f"{tag} name: {name}")
         except Exception as e:
-            sync_print(f"{tag} name fill failed: {e}")
-            with _pool_lock:
-                if slot_idx in _pool: _pool[slot_idx]['state'] = 'error'
-            return
+            sync_print(f"{tag} name failed: {e}"); return
+        if stop(): return
 
-        # Fill passcode if needed
+        # ── Passcode ──
         if passcode:
             try:
                 for sel in ['xpath=//input[@type="password"]',
                             'xpath=//*[@id="input-for-password"]',
-                            'xpath=//input[contains(@placeholder,"code")]']:
+                            'xpath=//input[contains(@placeholder,"code")]',
+                            'xpath=/html/body/div[2]/div[2]/div/div[1]/div/div[2]/div[2]/div/input']:
                     pi = page.locator(sel)
                     if await pi.count() > 0:
-                        await pi.first.wait_for(state="visible", timeout=3000)
-                        await asyncio.sleep(0.5)
+                        await pi.first.wait_for(state="visible", timeout=5000)
+                        await asyncio.sleep(1)
                         await pi.first.fill(passcode)
-                        sync_print(f"{tag} passcode pre-filled")
+                        sync_print(f"{tag} passcode filled")
                         break
-            except: pass
+            except Exception as e:
+                sync_print(f"{tag} passcode error: {e}")
+        if stop(): return
 
-        with _pool_lock:
-            if slot_idx in _pool:
-                _pool[slot_idx]['state'] = 'ready'
-                _pool[slot_idx]['name'] = name
-                _pool[slot_idx]['meeting_id'] = str(meeting_code).replace(' ','')
-
-        running_bots[bot_id] = {'browser': browser,
-                                 'meeting_id': str(meeting_code).replace(' ','')}
-        terminate_flags[bot_id] = False
-
-        sync_print(f"{tag} READY — waiting for launch signal")
-
-        # Wait for launch signal
-        launch_evt = asyncio.Event()
-        _launch_events[slot_idx] = launch_evt
-        await launch_evt.wait()
-
-        if terminate_flags.get(bot_id): return
-
-        with _pool_lock:
-            if slot_idx in _pool: _pool[slot_idx]['state'] = 'joining'
-
-        def stop():
-            return terminate_flags.get(bot_id, False)
-
-        # Click join
+        # ── Join button ──
         try:
             join_btn = None
             for sel in ['xpath=//button[contains(text(),"Join")]',
@@ -266,32 +224,31 @@ async def _pool_slot(slot_idx):
                     jb = page.locator(sel)
                     if await jb.count() > 0:
                         await jb.first.wait_for(state="visible", timeout=5000)
-                        join_btn = jb.first
-                        break
+                        join_btn = jb.first; break
                 except: continue
             if join_btn:
-                await asyncio.sleep(random.uniform(0.2, 0.8))
+                await asyncio.sleep(random.uniform(0.3, 0.8))
                 await join_btn.click()
-                sync_print(f"{tag} join clicked — entering meeting")
+                sync_print(f"{tag} join clicked")
             else:
-                sync_print(f"{tag} join btn not found")
+                sync_print(f"{tag} join btn not found"); return
         except Exception as e:
-            sync_print(f"{tag} join error: {e}")
-
-        await wait_for_meeting_to_start(page, tag)
-        await wait_for_waiting_room(page, tag)
-        await join_audio_computer(page, tag)
+            sync_print(f"{tag} join error: {e}"); return
 
         with _pool_lock:
             if slot_idx in _pool: _pool[slot_idx]['state'] = 'in_meeting'
 
-        sync_print(f"{tag} IN MEETING — staying {duration} min")
+        await wait_for_meeting_to_start(page, tag)
+        if stop(): return
+        await wait_for_waiting_room(page, tag)
+        if stop(): return
+        await join_audio_computer(page, tag)
 
+        sync_print(f"{tag} IN MEETING — staying {duration} min")
         end_time = asyncio.get_event_loop().time() + duration * 60
         while asyncio.get_event_loop().time() < end_time:
             if stop():
-                sync_print(f"{tag} terminated")
-                break
+                sync_print(f"{tag} terminated"); break
             await asyncio.sleep(2)
 
     except Exception as e:
@@ -314,287 +271,70 @@ def _start_pool():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         _pool_loop = loop
-        tasks = [loop.create_task(_pool_slot(i)) for i in range(_POOL_SIZE)]
+        tasks = [loop.create_task(_pool_slot(i)) for i in range(MAX_USERS_PER_INSTANCE)]
         loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
         try: loop.close()
         except: pass
-        sync_print("Pool ended")
+        sync_print("Pool closed")
     threading.Thread(target=_run, daemon=True).start()
-    sync_print(f"Opening {_POOL_SIZE} browser windows...")
+    sync_print(f"Opening {MAX_USERS_PER_INSTANCE} browser windows in background...")
 
-# ========== PRELOAD HANDLER ==========
-@sio.on(f'preload_{INSTANCE_ID}')
-def handle_preload(data):
-    """Dashboard sends meeting details — bots navigate + fill name immediately."""
-    meeting_code = data.get('meetingCode', '')
-    passcode     = str(data.get('passcode', '') or '').strip()
-    users        = data.get('users', MAX_USERS_PER_INSTANCE)
-    name_mode    = data.get('nameMode', 'indian')
-    custom_names = data.get('customNames', None)
-    duration     = data.get('duration', 90)
-
-    if not meeting_code:
-        sync_print("preload: no meetingCode"); return
-
-    sync_print(f"Pre-loading {users} bots for meeting {meeting_code}")
-
-    with _pool_lock:
-        idle_slots = [i for i, s in _pool.items() if s.get('state') == 'idle']
-
-    use_slots = idle_slots[:users]
-    if not use_slots:
-        sync_print("No idle windows! Pool may still be opening...")
-        return
-
-    for idx in use_slots:
-        _preload_data[idx] = {
-            'meetingCode': meeting_code, 'passcode': passcode,
-            'nameMode': name_mode, 'customNames': custom_names, 'duration': duration
-        }
-
-    if _pool_loop and not _pool_loop.is_closed():
-        for idx in use_slots:
-            evt = _preload_events.get(idx)
-            if evt:
-                _pool_loop.call_soon_threadsafe(evt.set)
-
-    sync_print(f"Sent pre-load signal to {len(use_slots)} windows")
-    try:
-        sio.emit('preloadAck', {'instanceId': INSTANCE_ID, 'slots': len(use_slots)})
-    except: pass
-
-# ========== LAUNCH HANDLER (instant join) ==========
+# ========== COMMAND HANDLER ==========
 @sio.on(f'command_{INSTANCE_ID}')
 def handle_command(data):
-    global current_bots, BOTS_TOTAL, BOTS_READY, BOTS_FAILED, READY_TO_JOIN, _bot_loop, PAGE_LOAD_SEM
+    global current_bots
 
     if data.get('action') in ['terminate', 'terminate_all']:
         handle_terminate(data); return
 
     users        = data.get('users', 1)
     meeting_code = data.get('meetingCode', '')
+    if not meeting_code:
+        sync_print("ERROR: no meetingCode"); return
+
     passcode     = str(data.get('passcode', '') or '').strip()
     duration     = data.get('duration', 90)
-    headless     = data.get('headless', True)
     name_mode    = data.get('nameMode', 'indian')
     custom_names = data.get('customNames', None)
 
-    if not meeting_code:
-        sync_print("ERROR: meetingCode missing"); return
-
-    mid = str(meeting_code).replace(' ','')
-
-    # Check if pre-loaded bots are ready for this meeting
+    # Find idle slots
     with _pool_lock:
-        ready_slots = [i for i, s in _pool.items()
-                       if s.get('state') == 'ready' and
-                       str(s.get('meeting_id','')).replace(' ','') == mid]
+        idle_slots = [i for i, s in _pool.items() if s.get('state') == 'idle']
 
-    if ready_slots:
-        # INSTANT JOIN PATH — bots already on meeting page with name filled
-        use_slots = ready_slots[:users]
-        sync_print(f"INSTANT JOIN: firing {len(use_slots)} pre-loaded bots!")
+    use_slots = idle_slots[:users]
+    if not use_slots:
+        sync_print("No idle windows! Pool may still be opening, please wait..."); return
 
-        with _pool_lock:
-            for idx in use_slots:
-                if idx in _pool: _pool[idx]['state'] = 'joining'
+    if len(use_slots) < users:
+        sync_print(f"Only {len(use_slots)} idle windows (requested {users})")
 
-        if _pool_loop and not _pool_loop.is_closed():
-            for idx in use_slots:
-                evt = _launch_events.get(idx)
-                if evt:
-                    _pool_loop.call_soon_threadsafe(evt.set)
+    sync_print(f"Firing {len(use_slots)} windows → {meeting_code} simultaneously!")
 
-        remaining = users - len(use_slots)
-        with bot_lock:
-            current_bots += len(use_slots)
-        try:
-            sio.emit('instanceUpdate', {'instanceId': INSTANCE_ID,
-                                        'currentUsers': current_bots,
-                                        'maxUsers': MAX_USERS_PER_INSTANCE})
-        except: pass
+    # Mark slots as taken and set data
+    with _pool_lock:
+        for idx in use_slots:
+            if idx in _pool: _pool[idx]['state'] = 'loading'
 
-        if remaining <= 0:
-            return
-        # Fall through to launch remaining normally
-        users = remaining
-        sync_print(f"{remaining} extra bots launching normally...")
+    for idx in use_slots:
+        _cmd_data[idx] = {
+            'meetingCode': meeting_code, 'passcode': passcode,
+            'nameMode': name_mode, 'customNames': custom_names, 'duration': duration
+        }
 
-    # NORMAL LAUNCH PATH (fallback if not pre-loaded)
-    sync_print(f"Starting {users} bots normally | meeting={meeting_code}")
-
-    def run_automation():
-        global BOTS_TOTAL, BOTS_READY, BOTS_FAILED, READY_TO_JOIN, _bot_loop, current_bots, PAGE_LOAD_SEM
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        _bot_loop = loop
-
-        BOTS_TOTAL    = users
-        BOTS_READY    = 0
-        BOTS_FAILED   = 0
-        READY_TO_JOIN = asyncio.Event()
-        PAGE_LOAD_SEM = asyncio.Semaphore(2)
-
-        tasks = [
-            loop.create_task(
-                start(f"[{INSTANCE_ID}-{i+1:02d}]", duration*60, meeting_code,
-                      passcode, headless, bot_index=i,
-                      bot_id=f"{INSTANCE_ID}-{i+1:02d}-{meeting_code}",
-                      name_mode=name_mode, custom_names=custom_names)
-            )
-            for i in range(users)
-        ]
-        loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
-        try: loop.run_until_complete(loop.shutdown_asyncgens())
-        except: pass
-        try: loop.close()
-        except: pass
-        gc.collect()
-
-        with bot_lock:
-            current_bots = max(0, current_bots - users)
-        sync_print(f"Batch done: {users} bots")
-        try:
-            sio.emit('instanceUpdate', {'instanceId': INSTANCE_ID,
-                                        'currentUsers': current_bots,
-                                        'maxUsers': MAX_USERS_PER_INSTANCE})
-        except: pass
+    # Fire all simultaneously
+    if _pool_loop and not _pool_loop.is_closed():
+        for idx in use_slots:
+            evt = _cmd_events.get(idx)
+            if evt:
+                _pool_loop.call_soon_threadsafe(evt.set)
 
     with bot_lock:
-        if current_bots + users <= MAX_USERS_PER_INSTANCE:
-            current_bots += users
-            threading.Thread(target=run_automation, daemon=True).start()
-        else:
-            sync_print(f"Capacity full ({current_bots}/{MAX_USERS_PER_INSTANCE})")
-
-# ========== NORMAL START (fallback) ==========
-async def start(tag, wait_time, meetingcode, passcode, headless,
-                bot_index=0, bot_id=None, name_mode="indian", custom_names=None):
-    global BOTS_FAILED
-
-    if bot_id:
-        terminate_flags[bot_id] = False
-
-    def stop():
-        return bot_id and terminate_flags.get(bot_id, False)
-
-    await PAGE_LOAD_SEM.acquire()
-    browser = None; context = None; page = None; sem_released = False
-
+        current_bots += len(use_slots)
     try:
-        if stop():
-            PAGE_LOAD_SEM.release(); return
-
-        p_inst = async_playwright()
-        p = await p_inst.__aenter__()
-        browser = await p.chromium.launch(
-            headless=headless,
-            args=['--no-sandbox','--disable-dev-shm-usage',
-                  '--use-fake-device-for-media-stream',
-                  '--use-file-for-fake-audio-capture=/dev/null',
-                  '--mute-audio','--disable-camera','--disable-video-capture',
-                  '--disable-gpu','--window-size=1280,720']
-        )
-        if bot_id:
-            running_bots[bot_id] = {'browser': browser, 'meeting_id': str(meetingcode).replace(' ','')}
-
-        context = await browser.new_context(permissions=[], viewport={"width":1280,"height":720})
-        page    = await context.new_page()
-        await page.goto(get_zoom_url(meetingcode), timeout=120000)
-        await page.wait_for_timeout(4000)
-
-        try:
-            ni = page.locator('xpath=//*[@id="input-for-name"]')
-            await ni.wait_for(state="visible", timeout=30000)
-            await asyncio.sleep(1)
-            user_name = get_name(name_mode, custom_names, bot_index)
-            await ni.fill(user_name)
-            sync_print(f"{tag} name filled: {user_name}")
-        except Exception as e:
-            sync_print(f"{tag} name fill failed: {e}")
-            async with BOTS_LOCK:
-                BOTS_FAILED += 1
-            PAGE_LOAD_SEM.release(); sem_released = True
-            try: await browser.close()
-            except: pass
-            running_bots.pop(bot_id, None); terminate_flags.pop(bot_id, None)
-            return
-
-        PAGE_LOAD_SEM.release(); sem_released = True
-        if stop(): raise Exception("TERMINATED")
-
-        passcode = str(passcode or '').strip()
-        if passcode:
-            try:
-                pass_input = None
-                for sel in ['xpath=//input[@type="password"]',
-                            'xpath=//*[@id="input-for-password"]',
-                            'xpath=//input[contains(@placeholder,"code")]',
-                            'xpath=/html/body/div[2]/div[2]/div/div[1]/div/div[2]/div[2]/div/input']:
-                    try:
-                        pi = page.locator(sel)
-                        if await pi.count() > 0:
-                            await pi.first.wait_for(state="visible", timeout=5000)
-                            pass_input = pi.first; break
-                    except: continue
-                if pass_input:
-                    await asyncio.sleep(1.5)
-                    await pass_input.fill(passcode)
-                    sync_print(f"{tag} passcode filled")
-            except Exception as e:
-                sync_print(f"{tag} passcode error: {e}")
-
-        await wait_for_all_bots()
-        if stop(): raise Exception("TERMINATED")
-
-        try:
-            join_btn = None
-            for sel in ['xpath=//button[contains(text(),"Join")]',
-                        'xpath=//button[contains(@class,"join")]',
-                        'xpath=//*[@id="root"]/div/div[1]/div/div[2]/button']:
-                try:
-                    jb = page.locator(sel)
-                    if await jb.count() > 0:
-                        await jb.first.wait_for(state="visible", timeout=5000)
-                        join_btn = jb.first; break
-                except: continue
-            if join_btn:
-                await asyncio.sleep(random.uniform(0.5, 1.5))
-                await join_btn.click()
-                sync_print(f"{tag} join clicked")
-            else:
-                sync_print(f"{tag} join button not found"); return
-        except Exception as e:
-            sync_print(f"{tag} join error: {e}"); return
-
-        await wait_for_meeting_to_start(page, tag)
-        await wait_for_waiting_room(page, tag)
-        await join_audio_computer(page, tag)
-
-        sync_print(f"{tag} in meeting, staying {wait_time//60} min")
-        elapsed = 0
-        while elapsed < wait_time:
-            if stop():
-                sync_print(f"{tag} terminated"); break
-            await asyncio.sleep(2); elapsed += 2
-
-    except Exception as e:
-        if "TERMINATED" not in str(e):
-            sync_print(f"{tag} error: {e}")
-        async with BOTS_LOCK:
-            BOTS_FAILED += 1
-        if not sem_released:
-            try: PAGE_LOAD_SEM.release()
-            except: pass
-    finally:
-        for obj in [page, context, browser]:
-            if obj:
-                try: await obj.close()
-                except: pass
-        gc.collect()
-        running_bots.pop(bot_id, None); terminate_flags.pop(bot_id, None)
-        sync_print(f"{tag} done")
+        sio.emit('instanceUpdate', {'instanceId': INSTANCE_ID,
+                                    'currentUsers': current_bots,
+                                    'maxUsers': MAX_USERS_PER_INSTANCE})
+    except: pass
 
 # ========== TERMINATE ==========
 @sio.on(f'terminate_{INSTANCE_ID}')
@@ -602,15 +342,19 @@ def handle_terminate(data):
     global current_bots
 
     meeting_id = data.get('meetingId') if isinstance(data, dict) else data
-    action = data.get('action','') if isinstance(data, dict) else ''
+    action     = data.get('action', '') if isinstance(data, dict) else ''
 
     if meeting_id in ('all', None, '') or action == 'terminate_all':
         targets = list(running_bots.items())
-        # Also kill all pool slots
+        # Also unblock any idle/loading pool slots so they exit
         with _pool_lock:
-            pool_bids = [s.get('bot_id') for s in _pool.values() if s.get('bot_id')]
-        for bid in pool_bids:
-            terminate_flags[bid] = True
+            all_bids = [s.get('bot_id') for s in _pool.values()]
+        for bid in all_bids:
+            if bid: terminate_flags[bid] = True
+        if _pool_loop and not _pool_loop.is_closed():
+            for evt in list(_cmd_events.values()):
+                try: _pool_loop.call_soon_threadsafe(evt.set)
+                except: pass
     else:
         mid = str(meeting_id).replace(' ','')
         targets = [(bid, b) for bid, b in list(running_bots.items())
@@ -622,33 +366,14 @@ def handle_terminate(data):
     for bid, _ in targets:
         terminate_flags[bid] = True
 
-    all_mtg = [bid for bid, b in list(running_bots.items())
-               if meeting_id in ('all', None, '') or
-               str(b.get('meeting_id','')).replace(' ','') == str(meeting_id).replace(' ','')]
-    if len(all_mtg) <= killed:
-        try:
-            loop = _pool_loop or _bot_loop
-            if loop and loop.is_running():
-                asyncio.run_coroutine_threadsafe(_unblock_sync(), loop)
-        except: pass
-        # Also unblock any waiting pool slots
-        if _pool_loop and not _pool_loop.is_closed():
-            for evt in list(_preload_events.values()):
-                try: _pool_loop.call_soon_threadsafe(evt.set)
-                except: pass
-            for evt in list(_launch_events.values()):
-                try: _pool_loop.call_soon_threadsafe(evt.set)
-                except: pass
-
     def cleanup():
         global current_bots
         futures = []
         for bid, info in targets:
             try:
                 br = info.get('browser')
-                loop = _pool_loop or _bot_loop
-                if br and loop and loop.is_running():
-                    futures.append(asyncio.run_coroutine_threadsafe(br.close(), loop))
+                if br and _pool_loop and _pool_loop.is_running():
+                    futures.append(asyncio.run_coroutine_threadsafe(br.close(), _pool_loop))
             except: pass
         for f in futures:
             try: f.result(timeout=5)
@@ -674,24 +399,25 @@ def handle_terminate(data):
 
     threading.Thread(target=cleanup, daemon=True).start()
 
+# ========== SHUTDOWN ==========
 @sio.on('shutdown')
 def handle_shutdown(_=None):
     sync_print("Shutdown received")
     try:
         with open('/content/SHUTDOWN_NOW','w') as f: f.write('1')
     except: pass
-    handle_terminate({'meetingId':'all'})
+    handle_terminate({'meetingId': 'all'})
     try:
         from google.colab import runtime
         runtime.unassign()
     except: pass
 
+# ========== SOCKET ==========
 @sio.event
 def connect():
     sync_print("Connected to server")
     sio.emit('register', {'instanceId': INSTANCE_ID,
                           'currentUsers': current_bots, 'maxUsers': MAX_USERS_PER_INSTANCE})
-    # Auto-start pool on connect
     _start_pool()
 
 @sio.event
@@ -711,13 +437,9 @@ def heartbeat_loop():
         try:
             if sio.connected:
                 sio.emit('heartbeat', {'instanceId': INSTANCE_ID, 'currentUsers': current_bots})
-                # Also report pool status
                 with _pool_lock:
-                    idle  = sum(1 for s in _pool.values() if s.get('state')=='idle')
-                    ready = sum(1 for s in _pool.values() if s.get('state')=='ready')
-                if idle > 0 or ready > 0:
-                    sio.emit('poolStatus', {'instanceId': INSTANCE_ID,
-                                            'idle': idle, 'ready': ready})
+                    idle = sum(1 for s in _pool.values() if s.get('state') == 'idle')
+                sio.emit('poolStatus', {'instanceId': INSTANCE_ID, 'idle': idle})
         except: pass
         time.sleep(5)
 

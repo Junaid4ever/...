@@ -167,9 +167,8 @@ async def _pool_slot(slot_idx):
         )
         page = await context.new_page()
 
-        # Block images, fonts, css — only load JS/HTML needed for joining
-        await page.route("**/*.{png,jpg,jpeg,gif,svg,webp,ico,woff,woff2,ttf,eot}", lambda r: r.abort())
-        await page.route("**/*.css", lambda r: r.abort())
+        # Block only images & fonts — CSS must load for Zoom buttons to render
+        await page.route("**/*.{png,jpg,jpeg,gif,webp,ico,woff,woff2,ttf,eot}", lambda r: r.abort())
 
         with _pool_lock:
             _pool[slot_idx] = {'browser': browser, 'context': context,

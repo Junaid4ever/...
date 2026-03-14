@@ -28,10 +28,15 @@ _sync_lock  = threading.Lock()
 _sync_count = 0
 _sync_total = 0
 
-# Only print these 3 things — nothing else
+# log() = Colab terminal + dashboard
+# dash() = dashboard only (detailed, not cluttering Colab)
 def log(msg):
     with _MUTEX:
         print(f"[{datetime.now().strftime('%H:%M:%S')}][{INSTANCE_ID}] {msg}")
+    try: sio.emit('botLog', {'instanceId': INSTANCE_ID, 'msg': str(msg)[:300]})
+    except: pass
+
+def dash(msg):
     try: sio.emit('botLog', {'instanceId': INSTANCE_ID, 'msg': str(msg)[:300]})
     except: pass
 
@@ -108,12 +113,12 @@ async def _sync_barrier():
         _sync_count += 1
         cnt = _sync_count
         tot = _sync_total
+    dash(f"[SYNC] {cnt}/{tot} bots ready")
     if cnt >= tot:
-        # Last bot arrived — release all
+        dash(f"[SYNC] All {tot} ready — joining together! 🚀")
         if _sync_event:
             _sync_event.set()
     else:
-        # Wait for others
         if _sync_event:
             await _sync_event.wait()
     yield
@@ -195,12 +200,15 @@ async def _pool_slot(slot_idx):
             ni = page.locator('xpath=//*[@id="input-for-name"]')
             await ni.wait_for(state="visible", timeout=30000)
             await ni.fill(name)
-        except: pass
+            dash(f"{tag} name filled: {name}")
+        except Exception as e:
+            dash(f"{tag} name failed: {e}")
         if stop(): return
 
         # Passcode
         if passcode:
             try:
+                filled = False
                 for sel in ['xpath=//input[@type="password"]',
                             'xpath=//*[@id="input-for-password"]',
                             'xpath=/html/body/div[2]/div[2]/div/div[1]/div/div[2]/div[2]/div/input']:
@@ -208,8 +216,11 @@ async def _pool_slot(slot_idx):
                     if await pi.count() > 0:
                         await pi.first.wait_for(state="visible", timeout=3000)
                         await pi.first.fill(passcode)
+                        filled = True
                         break
-            except: pass
+                dash(f"{tag} passcode {'filled' if filled else 'field not found'}")
+            except Exception as e:
+                dash(f"{tag} passcode error: {e}")
         if stop(): return
 
         # Find join button (but don't click yet)
@@ -227,7 +238,10 @@ async def _pool_slot(slot_idx):
             if join_btn: break
             await asyncio.sleep(1)
 
-        if not join_btn: return
+        if not join_btn:
+            dash(f"{tag} join button not found")
+            return
+        dash(f"{tag} join button ready — waiting for others...")
         if stop(): return
 
         # ── SYNC BARRIER: wait for all bots to reach join button ──
@@ -237,20 +251,25 @@ async def _pool_slot(slot_idx):
         if stop(): return
 
         # All bots click simultaneously
+        dash(f"{tag} joining now!")
         try:
             await join_btn.click()
         except: return
         if stop(): return
 
+        dash(f"{tag} checking meeting status...")
         await wait_meeting_start(page)
         if stop(): return
+        dash(f"{tag} checking waiting room...")
         await wait_waiting_room(page)
         if stop(): return
 
         # Small wait for Zoom meeting UI to fully render
         await asyncio.sleep(1.5)
+        dash(f"{tag} joining audio...")
         # Audio — join immediately when button appears
-        await join_audio(page)
+        ok = await join_audio(page)
+        dash(f"{tag} audio {'joined ✅' if ok else 'not found ⚠️'}")
 
         log(f"{tag} IN MEETING")
 

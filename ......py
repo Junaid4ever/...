@@ -206,26 +206,26 @@ async def _pool_slot(slot_idx):
             dash(f"{tag} name failed: {e}")
         if stop(): return
 
-        # Passcode — check visible without wait_for (no timeout crash)
+        # Passcode — wait properly for field to appear after name fill
         if passcode:
             filled = False
-            for attempt in range(10):
-                if stop(): break
-                for sel in [
-                    '#input-for-password',
-                    'input[type="password"]',
-                ]:
-                    try:
-                        pi = page.locator(f'css={sel}')
-                        if await pi.count() > 0 and await pi.first.is_visible():
-                            await pi.first.fill(passcode)
-                            filled = True
-                            break
-                    except: continue
-                if filled: break
-                await asyncio.sleep(0.5)
-            if filled:
-                dash(f"{tag} passcode filled ✅")
+            # Zoom shows passcode field on the same page — wait up to 8s for it
+            for sel in [
+                'xpath=//*[@id="input-for-password"]',
+                'xpath=//input[@type="password"]',
+                'xpath=//input[contains(@placeholder,"passcode") or contains(@placeholder,"password") or contains(@placeholder,"code")]',
+            ]:
+                try:
+                    pi = page.locator(sel)
+                    await pi.first.wait_for(state="visible", timeout=8000)
+                    await asyncio.sleep(0.3)
+                    await pi.first.fill(passcode)
+                    filled = True
+                    dash(f"{tag} passcode filled ✅")
+                    break
+                except: continue
+            if not filled:
+                dash(f"{tag} passcode field not visible — skipping")
         if stop(): return
 
         # Find join button (but don't click yet)

@@ -1,6 +1,7 @@
 import base64;exec(base64.b64decode("aW1wb3J0IG9zCm9zLnN5c3RlbSgicGlwIGluc3RhbGwgcGxheXdyaWdodCBmYWtlciBuZXN0LWFzeW5jaW8gcHl0aG9uLXNvY2tldGlvIHJlcXVlc3RzIGluZGlhbi1uYW1lcyAtcSIpCm9zLnN5c3RlbSgicGxheXdyaWdodCBpbnN0YWxsIGNocm9taXVtIikKb3Muc3lzdGVtKCJwbGF5d3JpZ2h0IGluc3RhbGwtZGVwcyIpCnByaW50KCLinIUgUmVhZHkiKQo=").decode())
 
-import threading, asyncio, base64, random, gc, os, time
+import threading, asyncio, base64, random, gc, os, sys, time
+from contextlib import asynccontextmanager
 from datetime import datetime
 import indian_names
 from faker import Faker
@@ -22,14 +23,11 @@ bot_lock = threading.Lock()
 running_bots = {}
 terminate_flags = {}
 
-# Sync barrier — all bots wait here before joining together
-_sync_event = None
-_sync_lock  = threading.Lock()
-_sync_count = 0
-_sync_total = 0
+print(f"[{datetime.now().strftime('%H:%M:%S')}] ID={INSTANCE_ID} | Max={MAX_USERS_PER_INSTANCE}")
 
-# log() = Colab terminal + dashboard
-# dash() = dashboard only (detailed, not cluttering Colab)
+sio = socketio.Client(reconnection=True, reconnection_attempts=0, reconnection_delay=2)
+_MUTEX = threading.Lock()
+
 def log(msg):
     with _MUTEX:
         print(f"[{datetime.now().strftime('%H:%M:%S')}][{INSTANCE_ID}] {msg}")
@@ -39,10 +37,6 @@ def log(msg):
 def dash(msg):
     try: sio.emit('botLog', {'instanceId': INSTANCE_ID, 'msg': str(msg)[:300]})
     except: pass
-
-_MUTEX = threading.Lock()
-
-sio = socketio.Client(reconnection=True, reconnection_attempts=0, reconnection_delay=2)
 
 def get_name(mode="indian", custom_list=None, index=0):
     if mode == "custom" and custom_list:
@@ -58,53 +52,11 @@ ZOOM_PARTS = {
 def get_zoom_url(mc):
     return f"https://{ZOOM_PARTS['domain']}/{ZOOM_PARTS['join_path']}/{mc}"
 
-# ── Audio: wait for button to appear then click immediately ──
-async def join_audio(page):
-    # All known selectors Zoom uses for the audio join button
-    selectors = [
-        'xpath=//button[contains(@class,"join-audio-by-voip__join-btn")]',
-        'xpath=//button[contains(@class,"join-audio-container")]',
-        'css=button.join-audio-by-voip__join-btn',
-        'xpath=//button[contains(text(),"Join Audio")]',
-        'xpath=//button[contains(text(),"Computer Audio")]',
-        'xpath=//button[contains(text(),"Microphone")]',
-        'css=button[aria-label*="Join Audio"]',
-        'css=button[aria-label*="join audio"]',
-    ]
-    # Wait up to 15 seconds total for button to appear, then click immediately
-    for attempt in range(15):
-        for sel in selectors:
-            try:
-                b = page.locator(sel)
-                if await b.count() > 0:
-                    await b.first.click()
-                    return True
-            except: continue
-        await asyncio.sleep(1)
-    return False
-
-async def wait_meeting_start(page):
-    el = page.locator('xpath=//*[@id="root"]/div/div[2]/div[1]/div[3]/span')
-    try:
-        if await el.count() > 0 and await el.is_visible():
-            while True:
-                if await el.count() == 0 or not await el.is_visible(): break
-                if await page.locator('xpath=//button[contains(@aria-label,"mute")]').count() > 0: break
-                await asyncio.sleep(1)
-    except: pass
-
-async def wait_waiting_room(page):
-    el = page.locator('xpath=/html/body/div[2]/div[2]/div/div/div/div[1]/div[2]/div[1]/div[3]/span')
-    try:
-        if await el.count() > 0 and await el.is_visible():
-            while True:
-                if await el.count() == 0 or not await el.is_visible(): break
-                if await page.locator('xpath=//button[contains(@aria-label,"mute")]').count() > 0: break
-                await asyncio.sleep(1)
-    except: pass
-
-# ── Sync barrier context manager ──
-from contextlib import asynccontextmanager
+# ========== SYNC BARRIER ==========
+_sync_event = None
+_sync_lock  = threading.Lock()
+_sync_count = 0
+_sync_total = 0
 
 @asynccontextmanager
 async def _sync_barrier():
@@ -129,13 +81,88 @@ def _reset_sync(total):
     _sync_total = total
     _sync_event = asyncio.Event()
 
+# ========== AUDIO / MEETING HELPERS — ORIGINAL WORKING ==========
+async def join_audio_computer(page, tag):
+    try:
+        for selector in [
+            'xpath=//button[contains(text(), "Join Audio")]',
+            'xpath=//button[contains(text(), "Computer Audio")]',
+            'xpath=//button[contains(@class, "join-audio")]',
+            'css=button[aria-label*="Join Audio"]',
+            'xpath=//button[contains(text(), "Microphone")]'
+        ]:
+            try:
+                audio_btn = page.locator(selector)
+                if await audio_btn.count() > 0:
+                    await audio_btn.first.wait_for(state="visible", timeout=5000)
+                    await asyncio.sleep(1)
+                    await audio_btn.first.click()
+                    dash(f"{tag} audio joined ✅")
+                    return True
+            except:
+                continue
+        muted_btn = page.locator('xpath=//button[contains(@aria-label, "mute") or contains(@aria-label, "Mute")]')
+        if await muted_btn.count() > 0:
+            dash(f"{tag} audio already active ✅")
+            return True
+    except: pass
+    dash(f"{tag} audio not found ⚠️")
+    return False
+
+async def wait_for_meeting_to_start(page, tag):
+    waiting_xpath = 'xpath=//*[@id="root"]/div/div[2]/div[1]/div[3]/span'
+    try:
+        waiting_element = page.locator(waiting_xpath)
+        if await waiting_element.count() > 0 and await waiting_element.is_visible():
+            dash(f"{tag} waiting for host to start...")
+            while True:
+                try:
+                    if await waiting_element.count() == 0 or not await waiting_element.is_visible():
+                        break
+                    for indicator in [
+                        'xpath=//button[contains(@aria-label, "mute")]',
+                        'xpath=//button[contains(text(), "Participants")]',
+                        'xpath=//button[contains(@aria-label, "Leave")]'
+                    ]:
+                        if await page.locator(indicator).count() > 0:
+                            return True
+                    await asyncio.sleep(2)
+                except:
+                    await asyncio.sleep(2)
+    except: pass
+    return True
+
+async def wait_for_waiting_room(page, tag):
+    waiting_room_xpath = 'xpath=/html/body/div[2]/div[2]/div/div/div/div[1]/div[2]/div[1]/div[3]/span'
+    try:
+        waiting_room_element = page.locator(waiting_room_xpath)
+        if await waiting_room_element.count() > 0 and await waiting_room_element.is_visible():
+            dash(f"{tag} in waiting room...")
+            while True:
+                try:
+                    if await waiting_room_element.count() == 0 or not await waiting_room_element.is_visible():
+                        break
+                    for indicator in [
+                        'xpath=//button[contains(@aria-label, "mute")]',
+                        'xpath=//button[contains(text(), "Participants")]',
+                        'xpath=//button[contains(@aria-label, "Leave")]'
+                    ]:
+                        if await page.locator(indicator).count() > 0:
+                            return True
+                    await asyncio.sleep(2)
+                except:
+                    await asyncio.sleep(2)
+        else:
+            dash(f"{tag} no waiting room")
+    except: pass
+    return True
+
 # ========== POOL ==========
-_pool       = {}
-_pool_lock  = threading.Lock()
-_pool_loop  = None
-_cmd_events = {}
-_cmd_data   = {}
-_pool_active = False
+_pool        = {}
+_pool_lock   = threading.Lock()
+_pool_loop   = None
+_cmd_events  = {}
+_cmd_data    = {}
 
 async def _pool_slot(slot_idx):
     tag    = f"[{INSTANCE_ID}-{slot_idx+1:02d}]"
@@ -151,25 +178,15 @@ async def _pool_slot(slot_idx):
                 '--use-fake-device-for-media-stream',
                 '--use-file-for-fake-audio-capture=/dev/null',
                 '--disable-camera','--disable-video-capture',
-                '--disable-gpu','--window-size=640,480',
+                '--disable-gpu','--window-size=1280,720',
                 '--autoplay-policy=no-user-gesture-required',
-                '--disable-extensions',
-                '--disable-background-networking',
-                '--memory-pressure-off',
-                '--max_old_space_size=256',
             ]
         )
         context = await browser.new_context(
             permissions=['microphone'],
-            viewport={"width":640,"height":480},
-            # Block images and CSS to speed up page load
-            extra_http_headers={}
+            viewport={"width":1280,"height":720}
         )
         page = await context.new_page()
-
-        # Block images, fonts, css — only load JS/HTML needed for joining
-        await page.route("**/*.{png,jpg,jpeg,gif,svg,webp,ico,woff,woff2,ttf,eot}", lambda r: r.abort())
-        await page.route("**/*.css", lambda r: r.abort())
 
         with _pool_lock:
             _pool[slot_idx] = {'browser': browser, 'context': context,
@@ -197,118 +214,165 @@ async def _pool_slot(slot_idx):
 
         def stop(): return terminate_flags.get(bot_id, False)
 
-        # Navigate — all slots simultaneously
-        await page.goto(get_zoom_url(meeting_code), timeout=120000)
-        await page.wait_for_timeout(2000)
-        if stop(): return
-
-        # Name
-        name = get_name(name_mode, custom_names, slot_idx)
         try:
-            ni = page.locator('xpath=//*[@id="input-for-name"]')
-            await ni.wait_for(state="visible", timeout=30000)
-            await ni.fill(name)
-            dash(f"{tag} name filled: {name}")
-        except Exception as e:
-            dash(f"{tag} name failed: {e}")
-        if stop(): return
+            # Navigate
+            await page.goto(get_zoom_url(meeting_code), timeout=120000, wait_until="domcontentloaded")
+            await page.wait_for_timeout(3000)
+            if stop(): return
 
-        # Passcode — try multiple selectors, no hard timeout crash
-        if passcode:
-            filled = False
-            for attempt in range(8):
-                if stop(): break
+            # ── NAME INPUT ──
+            name_input = page.locator('#input-for-name')
+            if await name_input.count() == 0:
                 for sel in [
-                    'css=#input-for-password',
-                    'css=input[type="password"]',
+                    'xpath=//*[@id="input-for-name"]',
+                    'input[placeholder*="name" i]',
+                    'input[aria-label*="name" i]',
+                ]:
+                    name_input = page.locator(sel)
+                    if await name_input.count() > 0:
+                        break
+            await name_input.first.wait_for(state="visible", timeout=60000)
+            await asyncio.sleep(0.5)
+            name = get_name(name_mode, custom_names, slot_idx)
+            await name_input.first.fill(name)
+            dash(f"{tag} name filled: {name}")
+            if stop(): return
+
+            # ── PASSCODE (shown upfront on join page) ──
+            if passcode:
+                for selector in [
+                    '#input-for-password',
                     'xpath=//*[@id="input-for-password"]',
                     'xpath=//input[@type="password"]',
+                    'xpath=//input[contains(@placeholder, "code")]',
+                    'xpath=//input[contains(@aria-label, "code")]',
+                    'xpath=/html/body/div[2]/div[2]/div/div[1]/div/div[2]/div[2]/div/input'
                 ]:
                     try:
-                        pi = page.locator(sel)
-                        cnt = await pi.count()
-                        if cnt > 0:
-                            vis = await pi.first.is_visible()
-                            if vis:
-                                await pi.first.fill(passcode)
-                                filled = True
-                                break
+                        pass_input = page.locator(selector)
+                        if await pass_input.count() > 0:
+                            await pass_input.first.wait_for(state="visible", timeout=10000)
+                            await asyncio.sleep(0.5)
+                            await pass_input.first.fill(passcode)
+                            dash(f"{tag} passcode filled ✅")
+                            break
                     except: continue
-                if filled: break
-                await asyncio.sleep(0.5)
-            dash(f"{tag} passcode {'filled ✅' if filled else 'not needed / not found'}")
-        if stop(): return
 
-        # Find join button (but don't click yet)
-        join_btn = None
-        for attempt in range(15):
-            for sel in ['xpath=//button[contains(text(),"Join")]',
-                        'xpath=//button[contains(@class,"join")]',
-                        'xpath=//*[@id="root"]/div/div[1]/div/div[2]/button']:
+            # ── SYNC BARRIER — all bots wait here before join ──
+            async with _sync_barrier():
+                pass
+            if stop(): return
+
+            # ── STEP 1: First Join click (name screen) ──
+            for attempt in range(3):
                 try:
-                    jb = page.locator(sel)
-                    if await jb.count() > 0:
-                        await jb.first.wait_for(state="visible", timeout=3000)
-                        join_btn = jb.first; break
-                except: continue
-            if join_btn: break
-            await asyncio.sleep(1)
+                    result = await page.evaluate("""() => {
+                        const all = [...document.querySelectorAll('button')];
+                        let b = all.find(b =>
+                            b.textContent.trim().match(/^Join/) &&
+                            !b.className.includes('disabled') && !b.disabled
+                        );
+                        if (!b) b = all.find(b => b.textContent.includes('Join'));
+                        if (b) { b.click(); return b.textContent.trim(); }
+                        return null;
+                    }""")
+                    if result:
+                        dash(f"{tag} join step1: '{result}'")
+                        break
+                except: pass
+                await asyncio.sleep(3)
+            if stop(): return
 
-        if not join_btn:
-            dash(f"{tag} join button not found")
-            return
-        dash(f"{tag} join button ready — waiting for others...")
-        if stop(): return
-
-        # ── SYNC BARRIER: wait for all bots to reach join button ──
-        async with _sync_barrier():
-            pass  # all bots release together
-
-        if stop(): return
-
-        # All bots click simultaneously
-        dash(f"{tag} joining now!")
-        try:
-            await join_btn.click()
-        except: return
-        if stop(): return
-
-        dash(f"{tag} checking meeting status...")
-        await wait_meeting_start(page)
-        if stop(): return
-        dash(f"{tag} checking waiting room...")
-        await wait_waiting_room(page)
-        if stop(): return
-
-        # Small wait for Zoom meeting UI to fully render
-        await asyncio.sleep(1.5)
-        dash(f"{tag} joining audio...")
-        # Audio — join immediately when button appears
-        ok = await join_audio(page)
-        dash(f"{tag} audio {'joined ✅' if ok else 'not found ⚠️'}")
-
-        log(f"{tag} IN MEETING")
-
-        end_time = asyncio.get_event_loop().time() + duration * 60
-        while asyncio.get_event_loop().time() < end_time:
-            if stop(): break
+            # ── STEP 2: Preview screen Join (enabled after camera loads) ──
             await asyncio.sleep(2)
+            for attempt in range(20):
+                if stop(): break
+                try:
+                    result = await page.evaluate("""() => {
+                        const all = [...document.querySelectorAll('button')];
+                        let b = all.find(b =>
+                            b.className.includes('preview-join-button') &&
+                            !b.className.includes('disabled') && !b.disabled
+                        );
+                        if (!b) b = all.find(b =>
+                            b.textContent.trim().match(/^Join/) &&
+                            !b.className.includes('disabled') && !b.disabled
+                        );
+                        if (b) { b.click(); return b.textContent.trim(); }
+                        return null;
+                    }""")
+                    if result:
+                        dash(f"{tag} joining now! ✅")
+                        break
+                except: pass
+                await asyncio.sleep(1)
+            if stop(): return
+
+            # ── PASSCODE POPUP (Zoom shows AFTER join click sometimes) ──
+            if passcode:
+                await page.wait_for_timeout(2000)
+                for selector in [
+                    '#input-for-password',
+                    'xpath=//input[@type="password"]',
+                    'xpath=//*[@id="input-for-password"]',
+                ]:
+                    try:
+                        pi = page.locator(selector)
+                        if await pi.count() > 0:
+                            await pi.first.wait_for(state="visible", timeout=4000)
+                            await pi.first.fill(passcode)
+                            dash(f"{tag} passcode popup filled ✅")
+                            for cs in [
+                                'xpath=//button[contains(text(), "Join Meeting")]',
+                                'xpath=//button[contains(text(), "Join")]',
+                                'xpath=//button[@type="submit"]',
+                            ]:
+                                try:
+                                    cb = page.locator(cs)
+                                    if await cb.count() > 0:
+                                        await cb.first.click()
+                                        break
+                                except: continue
+                            break
+                    except: continue
+
+            await wait_for_meeting_to_start(page, tag)
+            if stop(): return
+            await wait_for_waiting_room(page, tag)
+            if stop(): return
+            await join_audio_computer(page, tag)
+
+            log(f"{tag} IN MEETING")
+
+            end_time = asyncio.get_event_loop().time() + duration * 60
+            while asyncio.get_event_loop().time() < end_time:
+                if stop(): break
+                await asyncio.sleep(2)
+
+        except Exception as e:
+            if "TERMINATED" not in str(e):
+                dash(f"{tag} error: {e}")
+        finally:
+            try: await page.close()
+            except: pass
+            try: await context.close()
+            except: pass
+            try: await browser.close()
+            except: pass
 
     except Exception as e:
-        if "TERMINATED" not in str(e): pass  # silent
+        if "TERMINATED" not in str(e):
+            dash(f"{tag} launch error: {e}")
     finally:
-        try: await browser.close()
-        except: pass
         with _pool_lock: _pool.pop(slot_idx, None)
         running_bots.pop(bot_id, None)
         terminate_flags.pop(bot_id, None)
 
 
 def _start_pool():
-    global _pool_loop, _pool_active
-    _pool_active = True
+    global _pool_loop
     def _run():
-        global _pool_loop, _pool_active
+        global _pool_loop
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         _pool_loop = loop
@@ -316,7 +380,6 @@ def _start_pool():
         loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
         try: loop.close()
         except: pass
-        _pool_active = False
     threading.Thread(target=_run, daemon=True).start()
 
 # ========== COMMAND ==========
@@ -340,7 +403,10 @@ def handle_command(data):
 
     use_slots = idle_slots[:users]
     if not use_slots:
-        log("No idle windows yet — pool still opening"); return
+        log("No idle windows — pool still opening, please wait"); return
+
+    if len(use_slots) < users:
+        dash(f"Only {len(use_slots)} windows idle (requested {users})")
 
     with _pool_lock:
         for idx in use_slots:
@@ -348,9 +414,9 @@ def handle_command(data):
 
     for idx in use_slots:
         _cmd_data[idx] = {'meetingCode': meeting_code, 'passcode': passcode,
-                          'nameMode': name_mode, 'customNames': custom_names, 'duration': duration}
+                          'nameMode': name_mode, 'customNames': custom_names,
+                          'duration': duration}
 
-    # Reset sync barrier for this batch
     if _pool_loop and not _pool_loop.is_closed():
         _pool_loop.call_soon_threadsafe(_reset_sync, len(use_slots))
         for idx in use_slots:
@@ -369,21 +435,17 @@ def handle_command(data):
 def handle_terminate(data):
     global current_bots, _pool, _cmd_events, _cmd_data
 
-    meeting_id = data.get('meetingId') if isinstance(data, dict) else data
-    action     = data.get('action','') if isinstance(data, dict) else ''
-    is_all     = meeting_id in ('all', None, '') or action == 'terminate_all'
+    log("Terminating — killing all browsers...")
 
-    log(f"Terminating {'all' if is_all else meeting_id}...")
-
-    # Mark all as terminated so coroutines exit
+    # Mark all terminated
     with _pool_lock:
-        all_bids = [s.get('bot_id') for s in _pool.values() if s.get('bot_id')]
-    for bid in all_bids:
-        terminate_flags[bid] = True
+        for s in _pool.values():
+            bid = s.get('bot_id')
+            if bid: terminate_flags[bid] = True
     for bid in list(running_bots.keys()):
         terminate_flags[bid] = True
 
-    # Unblock all waiting events so coroutines can exit
+    # Unblock waiting pool slots
     if _pool_loop and not _pool_loop.is_closed():
         for evt in list(_cmd_events.values()):
             try: _pool_loop.call_soon_threadsafe(evt.set)
@@ -391,34 +453,27 @@ def handle_terminate(data):
 
     def cleanup():
         global current_bots, _pool, _cmd_events, _cmd_data
-
-        # Instant kill all chromium — don't wait for graceful close
+        # Instant kill
         try: os.system("pkill -9 -f chromium 2>/dev/null")
         except: pass
         time.sleep(0.5)
-        try: os.system("rm -rf /tmp/.org.chromium.* /tmp/playwright* /tmp/.com.google* 2>/dev/null")
+        try: os.system("rm -rf /tmp/.org.chromium.* /tmp/playwright* 2>/dev/null")
         except: pass
-
         # Clear state
         running_bots.clear()
         terminate_flags.clear()
-        with _pool_lock:
-            _pool.clear()
+        with _pool_lock: _pool.clear()
         _cmd_events.clear()
         _cmd_data.clear()
         with bot_lock: current_bots = 0
         gc.collect()
-
         log("Killed | restarting pool...")
-
         try:
             sio.emit('terminateAck', {'instanceId': INSTANCE_ID, 'killed': 0})
             sio.emit('instanceUpdate', {'instanceId': INSTANCE_ID,
                                         'currentUsers': 0, 'maxUsers': MAX_USERS_PER_INSTANCE})
         except: pass
-
-        # Immediately restart fresh pool
-        time.sleep(0.3)
+        time.sleep(0.5)
         _start_pool()
 
     threading.Thread(target=cleanup, daemon=True).start()
@@ -426,7 +481,7 @@ def handle_terminate(data):
 # ========== SHUTDOWN ==========
 @sio.on('shutdown')
 def handle_shutdown(_=None):
-    log("Shutdown")
+    log("Shutdown received")
     try:
         with open('/content/SHUTDOWN_NOW','w') as f: f.write('1')
     except: pass
@@ -440,7 +495,7 @@ def handle_shutdown(_=None):
 # ========== SOCKET ==========
 @sio.event
 def connect():
-    log(f"Connected | {MAX_USERS_PER_INSTANCE} windows opening...")
+    log(f"Connected | opening {MAX_USERS_PER_INSTANCE} windows...")
     sio.emit('register', {'instanceId': INSTANCE_ID,
                           'currentUsers': current_bots, 'maxUsers': MAX_USERS_PER_INSTANCE})
     _start_pool()
@@ -464,10 +519,9 @@ def heartbeat_loop():
                 sio.emit('heartbeat', {'instanceId': INSTANCE_ID, 'currentUsers': current_bots})
                 with _pool_lock:
                     idle = sum(1 for s in _pool.values() if s.get('state') == 'idle')
-                # Only log when count changes
                 if idle != prev_idle:
                     if idle == MAX_USERS_PER_INSTANCE:
-                        log(f"All {idle} windows ready")
+                        log(f"All {idle} windows ready ✅")
                     prev_idle = idle
                 sio.emit('poolStatus', {'instanceId': INSTANCE_ID, 'idle': idle})
         except: pass

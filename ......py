@@ -41,7 +41,6 @@ def sync_print(msg):
     with MUTEX:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
     try:
-        # Skip noisy system messages
         msg_str = str(msg)
         skip_keywords = ['--disable', '--enable', 'chromium', 'libatk', 'shared lib',
                          'temporary dir', 'pid=', 'chrome-headless']
@@ -378,7 +377,6 @@ def handle_terminate(data):
 
     def cleanup():
         global current_bots
-
         futures = []
         for bot_id, info in targets:
             try:
@@ -389,23 +387,19 @@ def handle_terminate(data):
         for f in futures:
             try: f.result(timeout=5)
             except: pass
-
         time.sleep(1)
-
         target_ids = [bid for bid, _ in targets]
         for bid in target_ids:
             running_bots.pop(bid, None)
             terminate_flags.pop(bid, None)
         with bot_lock:
             current_bots = max(0, current_bots - killed)
-
         if len(running_bots) == 0:
             try: os.system("pkill -9 -f chromium 2>/dev/null; pkill -9 -f chrome 2>/dev/null")
             except: pass
             try: os.system("rm -rf /tmp/.org.chromium.* /tmp/playwright* 2>/dev/null")
             except: pass
         gc.collect()
-
         sync_print(f"Freed {killed} | active={len(running_bots)} | READY")
         try:
             sio.emit('terminateAck', {'instanceId': INSTANCE_ID, 'killed': killed})
@@ -506,11 +500,9 @@ def disconnect():
 def handle_shutdown(_=None):
     sync_print("Shutdown signal received — unassigning Colab runtime...")
     try:
-        # Write trigger file — Cell 3 watcher picks it up
         with open('/content/SHUTDOWN_NOW', 'w') as f:
             f.write('1')
         sync_print("Shutdown trigger written")
-        # Also try direct call
         try:
             from google.colab import runtime
             runtime.unassign()
@@ -544,11 +536,10 @@ except Exception as e:
 while True:
     time.sleep(1)
     if _SHOULD_UNASSIGN:
-        # Write a trigger file that Cell 3 watches
         try:
             with open('/content/unassign_trigger.txt', 'w') as f:
                 f.write('1')
             sync_print("Unassign trigger written — waiting for cell to pick up...")
         except Exception as e:
             sync_print(f"Trigger write error: {e}")
-        break  # Exit main loop so cell finishes and next cell can run
+        break

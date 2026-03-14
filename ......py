@@ -151,24 +151,18 @@ async def _pool_slot(slot_idx):
                 '--use-fake-device-for-media-stream',
                 '--use-file-for-fake-audio-capture=/dev/null',
                 '--disable-camera','--disable-video-capture',
-                '--disable-gpu','--window-size=640,480',
+                '--disable-gpu','--window-size=1280,720',
                 '--autoplay-policy=no-user-gesture-required',
-                '--disable-extensions',
-                '--disable-background-networking',
-                '--memory-pressure-off',
-                '--max_old_space_size=256',
             ]
         )
         context = await browser.new_context(
             permissions=['microphone'],
-            viewport={"width":640,"height":480},
+            viewport={"width":1280,"height":720},
             # Block images and CSS to speed up page load
-            extra_http_headers={}
         )
         page = await context.new_page()
 
         # Block only images & fonts — CSS must load for Zoom buttons to render
-        await page.route("**/*.{png,jpg,jpeg,gif,webp,ico,woff,woff2,ttf,eot}", lambda r: r.abort())
 
         with _pool_lock:
             _pool[slot_idx] = {'browser': browser, 'context': context,
@@ -212,30 +206,26 @@ async def _pool_slot(slot_idx):
             dash(f"{tag} name failed: {e}")
         if stop(): return
 
-        # Passcode — try multiple selectors, no hard timeout crash
+        # Passcode — check visible without wait_for (no timeout crash)
         if passcode:
             filled = False
-            for attempt in range(8):
+            for attempt in range(10):
                 if stop(): break
                 for sel in [
-                    'css=#input-for-password',
-                    'css=input[type="password"]',
-                    'xpath=//*[@id="input-for-password"]',
-                    'xpath=//input[@type="password"]',
+                    '#input-for-password',
+                    'input[type="password"]',
                 ]:
                     try:
-                        pi = page.locator(sel)
-                        cnt = await pi.count()
-                        if cnt > 0:
-                            vis = await pi.first.is_visible()
-                            if vis:
-                                await pi.first.fill(passcode)
-                                filled = True
-                                break
+                        pi = page.locator(f'css={sel}')
+                        if await pi.count() > 0 and await pi.first.is_visible():
+                            await pi.first.fill(passcode)
+                            filled = True
+                            break
                     except: continue
                 if filled: break
                 await asyncio.sleep(0.5)
-            dash(f"{tag} passcode {'filled ✅' if filled else 'not needed / not found'}")
+            if filled:
+                dash(f"{tag} passcode filled ✅")
         if stop(): return
 
         # Find join button (but don't click yet)

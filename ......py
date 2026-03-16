@@ -211,14 +211,26 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
                 '--use-file-for-fake-audio-capture=/dev/null',
                 '--mute-audio', '--disable-camera', '--disable-video-capture',
                 '--disable-gpu', '--window-size=1280,720',
+                '--incognito',
+                '--disable-extensions',
+                '--no-first-run',
+                '--disable-default-apps',
             ]
         )
 
         if bot_id:
             running_bots[bot_id] = {'browser': browser, 'meeting_id': str(meetingcode).replace(' ','')}
 
-        context = await browser.new_context(permissions=[], viewport={"width": 1280, "height": 720})
-        page    = await context.new_page()
+        context = await browser.new_context(
+            permissions=[],
+            viewport={"width": 1280, "height": 720},
+            # Block all dialogs/prompts automatically
+        )
+        # Block all dialogs (alert, confirm, prompt)
+        async def _block_dialog(dialog):
+            await dialog.dismiss()
+        page = await context.new_page()
+        page.on("dialog", _block_dialog)
 
         zoom_url = get_zoom_url(meetingcode)
         await page.goto(zoom_url, timeout=120000)
@@ -251,15 +263,17 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
         # PASSCODE
         if passcode is not None and passcode != "":
             sync_print(f"{tag} attempting to enter passcode: {passcode}")
+            pass_input = None
             try:
                 passcode_selectors = [
+                    # New xpath provided by user (highest priority)
+                    'xpath=/html/body/div[2]/div[1]/div/div[1]/div/div[2]/div[2]/div/input',
+                    'xpath=//*[@id="input-for-password"]',
                     'xpath=//input[@type="password"]',
                     'xpath=//input[contains(@placeholder, "code")]',
                     'xpath=//input[contains(@aria-label, "code")]',
-                    'xpath=//*[@id="input-for-password"]',
-                    'xpath=/html/body/div[2]/div[2]/div/div[1]/div/div[2]/div[2]/div/input'
+                    'xpath=/html/body/div[2]/div[2]/div/div[1]/div/div[2]/div[2]/div/input',
                 ]
-                pass_input = None
                 for selector in passcode_selectors:
                     try:
                         pi = page.locator(selector)
@@ -268,13 +282,26 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
                             pass_input = pi.first
                             break
                     except:
-                        continue  # selector nahi mila, agla try karo
+                        continue
                 if pass_input:
                     await asyncio.sleep(0.5)
                     await pass_input.fill(passcode)
                     sync_print(f"{tag} passcode filled: {passcode}")
                 else:
-                    sync_print(f"{tag} passcode field nahi mila — meeting me passcode nahi hoga")
+                    sync_print(f"{tag} passcode field not found — taking screenshot")
+                    try:
+                        import base64 as _b64
+                        ss = await page.screenshot(type='jpeg', quality=60, full_page=False)
+                        ss_b64 = _b64.b64encode(ss).decode()
+                        sio.emit('botScreenshot', {
+                            'instanceId': INSTANCE_ID,
+                            'tag': tag,
+                            'meetingId': str(meetingcode).replace(' ',''),
+                            'screenshot': ss_b64,
+                            'reason': 'passcode field not found'
+                        })
+                    except Exception as se:
+                        sync_print(f"{tag} screenshot error: {se}")
             except Exception as e:
                 sync_print(f"{tag} passcode fill error: {e}")
         else:

@@ -250,25 +250,35 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
 
         # PASSCODE
         if passcode is not None and passcode != "":
-            # Use is_visible() — no timeout, no crash if field not present
-            filled = False
-            for selector in [
-                'xpath=//*[@id="input-for-password"]',
-                'xpath=//input[@type="password"]',
-                'xpath=//input[contains(@placeholder, "code")]',
-                'xpath=//input[contains(@aria-label, "code")]',
-            ]:
-                try:
-                    pi = page.locator(selector)
-                    if await pi.count() > 0 and await pi.first.is_visible():
-                        await asyncio.sleep(0.5)
-                        await pi.first.fill(passcode)
-                        sync_print(f"{tag} passcode filled: {passcode}")
-                        filled = True
-                        break
-                except: continue
-            if not filled:
-                sync_print(f"{tag} passcode field not visible — skipping")
+            sync_print(f"{tag} attempting to enter passcode: {passcode}")
+            try:
+                passcode_selectors = [
+                    'xpath=//input[@type="password"]',
+                    'xpath=//input[contains(@placeholder, "code")]',
+                    'xpath=//input[contains(@aria-label, "code")]',
+                    'xpath=//*[@id="input-for-password"]',
+                    'xpath=/html/body/div[2]/div[2]/div/div[1]/div/div[2]/div[2]/div/input'
+                ]
+                pass_input = None
+                for selector in passcode_selectors:
+                    try:
+                        pi = page.locator(selector)
+                        if await pi.count() > 0:
+                            await pi.first.wait_for(state="visible", timeout=8000)
+                            pass_input = pi.first
+                            break
+                    except:
+                        continue  # selector nahi mila, agla try karo
+                if pass_input:
+                    await asyncio.sleep(0.5)
+                    await pass_input.fill(passcode)
+                    sync_print(f"{tag} passcode filled: {passcode}")
+                else:
+                    sync_print(f"{tag} passcode field nahi mila — meeting me passcode nahi hoga")
+            except Exception as e:
+                sync_print(f"{tag} passcode fill error: {e}")
+        else:
+            sync_print(f"{tag} no passcode provided (empty), skipping passcode field")
 
         # SYNC BARRIER
         await wait_for_all_bots()
@@ -514,20 +524,16 @@ def heartbeat_loop():
             if sio.connected:
                 sio.emit('heartbeat', {'instanceId': INSTANCE_ID, 'currentUsers': current_bots})
             else:
-                # Not connected — try to reconnect
-                try:
-                    sio.connect(NGROK_URL, transports=['websocket', 'polling'])
+                try: sio.connect(NGROK_URL, transports=['websocket', 'polling'])
                 except: pass
         except: pass
         time.sleep(5)
 
 def keep_alive_loop():
-    """Aggressive reconnect — if disconnected, keep trying every 2s"""
     while True:
         time.sleep(2)
         if not sio.connected:
-            try:
-                sio.connect(NGROK_URL, transports=['websocket', 'polling'])
+            try: sio.connect(NGROK_URL, transports=['websocket', 'polling'])
             except: pass
 
 try:

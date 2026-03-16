@@ -34,7 +34,7 @@ PAGE_LOAD_SEM = None
 
 print(f"[{datetime.now().strftime('%H:%M:%S')}] ID={INSTANCE_ID} | Max={MAX_USERS_PER_INSTANCE}")
 
-sio = socketio.Client(reconnection=True)
+sio = socketio.Client(reconnection=True, reconnection_attempts=0, reconnection_delay=1, reconnection_delay_max=3)
 MUTEX = threading.Lock()
 
 def sync_print(msg):
@@ -250,35 +250,25 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
 
         # PASSCODE
         if passcode is not None and passcode != "":
-            sync_print(f"{tag} attempting to enter passcode: {passcode}")
-            try:
-                passcode_selectors = [
-                    'xpath=//input[@type="password"]',
-                    'xpath=//input[contains(@placeholder, "code")]',
-                    'xpath=//input[contains(@aria-label, "code")]',
-                    'xpath=//*[@id="input-for-password"]',
-                    'xpath=/html/body/div[2]/div[2]/div/div[1]/div/div[2]/div[2]/div/input'
-                ]
-                pass_input = None
-                for selector in passcode_selectors:
-                    try:
-                        pass_input = page.locator(selector)
-                        if await pass_input.count() > 0:
-                            await pass_input.first.wait_for(state="visible", timeout=5000)
-                            pass_input = pass_input.first
-                            break
-                    except:
-                        continue
-                if pass_input:
-                    await asyncio.sleep(1.5)
-                    await pass_input.fill(passcode)
-                    sync_print(f"{tag} passcode filled: {passcode}")
-                else:
-                    sync_print(f"{tag} no passcode field found")
-            except Exception as e:
-                sync_print(f"{tag} passcode fill error: {e}")
-        else:
-            sync_print(f"{tag} no passcode provided (empty), skipping passcode field")
+            # Use is_visible() — no timeout, no crash if field not present
+            filled = False
+            for selector in [
+                'xpath=//*[@id="input-for-password"]',
+                'xpath=//input[@type="password"]',
+                'xpath=//input[contains(@placeholder, "code")]',
+                'xpath=//input[contains(@aria-label, "code")]',
+            ]:
+                try:
+                    pi = page.locator(selector)
+                    if await pi.count() > 0 and await pi.first.is_visible():
+                        await asyncio.sleep(0.5)
+                        await pi.first.fill(passcode)
+                        sync_print(f"{tag} passcode filled: {passcode}")
+                        filled = True
+                        break
+                except: continue
+            if not filled:
+                sync_print(f"{tag} passcode field not visible — skipping")
 
         # SYNC BARRIER
         await wait_for_all_bots()
@@ -523,12 +513,27 @@ def heartbeat_loop():
         try:
             if sio.connected:
                 sio.emit('heartbeat', {'instanceId': INSTANCE_ID, 'currentUsers': current_bots})
+            else:
+                # Not connected — try to reconnect
+                try:
+                    sio.connect(NGROK_URL, transports=['websocket', 'polling'])
+                except: pass
         except: pass
         time.sleep(5)
+
+def keep_alive_loop():
+    """Aggressive reconnect — if disconnected, keep trying every 2s"""
+    while True:
+        time.sleep(2)
+        if not sio.connected:
+            try:
+                sio.connect(NGROK_URL, transports=['websocket', 'polling'])
+            except: pass
 
 try:
     sio.connect(NGROK_URL, transports=['websocket', 'polling'])
     threading.Thread(target=heartbeat_loop, daemon=True).start()
+    threading.Thread(target=keep_alive_loop, daemon=True).start()
     sync_print("Ready")
 except Exception as e:
     sync_print(f"Connect failed: {e}")

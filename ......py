@@ -34,13 +34,14 @@ PAGE_LOAD_SEM = None
 
 print(f"[{datetime.now().strftime('%H:%M:%S')}] ID={INSTANCE_ID} | Max={MAX_USERS_PER_INSTANCE}")
 
-sio = socketio.Client(reconnection=True, reconnection_attempts=0, reconnection_delay=1, reconnection_delay_max=3)
+sio = socketio.Client(reconnection=True)
 MUTEX = threading.Lock()
 
 def sync_print(msg):
     with MUTEX:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
     try:
+        # Skip noisy system messages
         msg_str = str(msg)
         skip_keywords = ['--disable', '--enable', 'chromium', 'libatk', 'shared lib',
                          'temporary dir', 'pid=', 'chrome-headless']
@@ -211,20 +212,14 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
                 '--use-file-for-fake-audio-capture=/dev/null',
                 '--mute-audio', '--disable-camera', '--disable-video-capture',
                 '--disable-gpu', '--window-size=1280,720',
-                '--incognito',
-                '--disable-extensions',
-                '--no-first-run',
-                '--disable-default-apps',
             ]
         )
 
         if bot_id:
             running_bots[bot_id] = {'browser': browser, 'meeting_id': str(meetingcode).replace(' ','')}
 
-        context = await browser.new_context(
-            permissions=[],
-            viewport={"width": 1280, "height": 720},
-        )
+        context = await browser.new_context(permissions=[], viewport={"width": 1280, "height": 720})
+        
         # Block all dialogs (alert, confirm, prompt)
         async def _block_dialog(dialog):
             await dialog.dismiss()
@@ -434,6 +429,7 @@ def handle_terminate(data):
 
     def cleanup():
         global current_bots
+
         futures = []
         for bot_id, info in targets:
             try:
@@ -444,19 +440,23 @@ def handle_terminate(data):
         for f in futures:
             try: f.result(timeout=5)
             except: pass
+
         time.sleep(1)
+
         target_ids = [bid for bid, _ in targets]
         for bid in target_ids:
             running_bots.pop(bid, None)
             terminate_flags.pop(bid, None)
         with bot_lock:
             current_bots = max(0, current_bots - killed)
+
         if len(running_bots) == 0:
             try: os.system("pkill -9 -f chromium 2>/dev/null; pkill -9 -f chrome 2>/dev/null")
             except: pass
             try: os.system("rm -rf /tmp/.org.chromium.* /tmp/playwright* 2>/dev/null")
             except: pass
         gc.collect()
+
         sync_print(f"Freed {killed} | active={len(running_bots)} | READY")
         try:
             sio.emit('terminateAck', {'instanceId': INSTANCE_ID, 'killed': killed})
@@ -557,9 +557,11 @@ def disconnect():
 def handle_shutdown(_=None):
     sync_print("Shutdown signal received — unassigning Colab runtime...")
     try:
+        # Write trigger file — Cell 3 watcher picks it up
         with open('/content/SHUTDOWN_NOW', 'w') as f:
             f.write('1')
         sync_print("Shutdown trigger written")
+        # Also try direct call
         try:
             from google.colab import runtime
             runtime.unassign()
@@ -580,23 +582,12 @@ def heartbeat_loop():
         try:
             if sio.connected:
                 sio.emit('heartbeat', {'instanceId': INSTANCE_ID, 'currentUsers': current_bots})
-            else:
-                try: sio.connect(NGROK_URL, transports=['websocket', 'polling'])
-                except: pass
         except: pass
         time.sleep(5)
-
-def keep_alive_loop():
-    while True:
-        time.sleep(2)
-        if not sio.connected:
-            try: sio.connect(NGROK_URL, transports=['websocket', 'polling'])
-            except: pass
 
 try:
     sio.connect(NGROK_URL, transports=['websocket', 'polling'])
     threading.Thread(target=heartbeat_loop, daemon=True).start()
-    threading.Thread(target=keep_alive_loop, daemon=True).start()
     sync_print("Ready")
 except Exception as e:
     sync_print(f"Connect failed: {e}")
@@ -604,10 +595,11 @@ except Exception as e:
 while True:
     time.sleep(1)
     if _SHOULD_UNASSIGN:
+        # Write a trigger file that Cell 3 watches
         try:
             with open('/content/unassign_trigger.txt', 'w') as f:
                 f.write('1')
             sync_print("Unassign trigger written — waiting for cell to pick up...")
         except Exception as e:
             sync_print(f"Trigger write error: {e}")
-        break
+        break  # Exit main loop so cell finishes and next cell can run

@@ -34,7 +34,7 @@ PAGE_LOAD_SEM = None
 
 print(f"[{datetime.now().strftime('%H:%M:%S')}] ID={INSTANCE_ID} | Max={MAX_USERS_PER_INSTANCE}")
 
-sio = socketio.Client(reconnection=True, reconnection_attempts=0, reconnection_delay=1, reconnection_delay_max=3)
+sio = socketio.Client(reconnection=True)
 MUTEX = threading.Lock()
 
 def sync_print(msg):
@@ -92,40 +92,27 @@ async def _unblock_sync():
 # ========== AUDIO / WAIT HELPERS ==========
 async def join_audio_computer(page, tag):
     try:
-        # Wait a moment for audio dialog
-        await asyncio.sleep(1.5)
-        audio_selectors = [
+        for selector in [
+            'xpath=//button[contains(text(), "Join Audio")]',
+            'xpath=//button[contains(text(), "Computer Audio")]',
+            'xpath=//button[contains(@class, "join-audio")]',
             'css=button[aria-label*="Join Audio"]',
-            'css=button[aria-label*="join audio" i]',
-            'xpath=//button[contains(text(),"Join Audio")]',
-            'xpath=//button[contains(text(),"Computer Audio")]',
-            'xpath=//button[contains(@class,"join-audio")]',
-            'xpath=//button[contains(text(),"Microphone")]',
-            'xpath=//button[@data-testid="join-audio-btn"]',
-        ]
-        for selector in audio_selectors:
+            'xpath=//button[contains(text(), "Microphone")]'
+        ]:
             try:
                 audio_btn = page.locator(selector)
                 if await audio_btn.count() > 0:
-                    await audio_btn.first.wait_for(state="visible", timeout=3000)
+                    await audio_btn.first.wait_for(state="visible", timeout=5000)
+                    await asyncio.sleep(1)
                     await audio_btn.first.click()
                     sync_print(f"{tag} audio joined")
                     return True
             except:
                 continue
-        # Check already in audio
-        muted = page.locator('css=button[aria-label*="mute" i], button[aria-label*="Mute"]')
-        if await muted.count() > 0:
+        muted_btn = page.locator('xpath=//button[contains(@aria-label, "mute") or contains(@aria-label, "Mute")]')
+        if await muted_btn.count() > 0:
             sync_print(f"{tag} already has audio")
             return True
-        # Try clicking "Join Audio by Computer" in the dialog
-        try:
-            cab = page.locator('xpath=//button[contains(text(),"Computer") or contains(@aria-label,"Computer")]')
-            if await cab.count() > 0:
-                await cab.first.click()
-                sync_print(f"{tag} audio joined via Computer btn")
-                return True
-        except: pass
     except Exception as e:
         sync_print(f"{tag} audio join skipped: {e}")
     return False
@@ -225,7 +212,6 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
                 '--mute-audio', '--disable-camera', '--disable-video-capture',
                 '--disable-gpu', '--window-size=1280,720',
                 '--incognito',
-                '--disable-extensions',
                 '--no-first-run',
                 '--disable-default-apps',
             ]
@@ -237,51 +223,26 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
         context = await browser.new_context(
             permissions=[],
             viewport={"width": 1280, "height": 720},
-            # Block all dialogs/prompts automatically
         )
-        # Block all dialogs (alert, confirm, prompt)
         async def _block_dialog(dialog):
             await dialog.dismiss()
         page = await context.new_page()
         page.on("dialog", _block_dialog)
 
         zoom_url = get_zoom_url(meetingcode)
-        await page.goto(zoom_url, timeout=90000)
-        await page.wait_for_load_state("domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(2500)
+        await page.goto(zoom_url, timeout=120000)
+        await page.wait_for_timeout(4000)
 
-        # NAME INPUT — robust multi-selector with retry
-        name_filled = False
-        user_name = get_name(name_mode, custom_names, bot_index)
-        name_selectors = [
-            '#input-for-name',
-            'input[id="input-for-name"]',
-            'xpath=//*[@id="input-for-name"]',
-            'input[aria-label*="name" i]',
-            'input[placeholder*="name" i]',
-            'xpath=//input[@type="text"][1]',
-        ]
-        for _attempt in range(3):
-            for sel in name_selectors:
-                try:
-                    ni = page.locator(sel)
-                    if await ni.count() > 0:
-                        await ni.first.wait_for(state="visible", timeout=8000)
-                        await ni.first.triple_click()
-                        await ni.first.fill("")
-                        await ni.first.type(user_name, delay=30)
-                        actual = await ni.first.input_value()
-                        if actual.strip():
-                            sync_print(f"{tag} name filled: {actual}")
-                            name_filled = True
-                            break
-                except:
-                    continue
-            if name_filled:
-                break
-            await asyncio.sleep(1.5)
-        if not name_filled:
-            sync_print(f"{tag} name fill failed after retries")
+        # NAME INPUT
+        try:
+            name_input = page.locator('xpath=//*[@id="input-for-name"]')
+            await name_input.wait_for(state="visible", timeout=30000)
+            await asyncio.sleep(1)
+            user_name = get_name(name_mode, custom_names, bot_index)
+            await name_input.fill(user_name)
+            sync_print(f"{tag} name filled: {user_name}")
+        except Exception as e:
+            sync_print(f"{tag} name fill failed: {e}")
             async with BOTS_LOCK:
                 BOTS_FAILED += 1
             PAGE_LOAD_SEM.release()
@@ -296,13 +257,12 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
 
         if stop(): raise Exception("TERMINATED")
 
-        # PASSCODE
+        # PASSCODE — robust multi-selector with screenshot fallback
         if passcode is not None and passcode != "":
             sync_print(f"{tag} attempting to enter passcode: {passcode}")
             pass_input = None
             try:
                 passcode_selectors = [
-                    # New xpath provided by user (highest priority)
                     'xpath=/html/body/div[2]/div[1]/div/div[1]/div/div[2]/div[2]/div/input',
                     'xpath=//*[@id="input-for-password"]',
                     'xpath=//input[@type="password"]',
@@ -347,44 +307,33 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
         await wait_for_all_bots()
         if stop(): raise Exception("TERMINATED")
 
-        # JOIN BUTTON — robust selectors + Enter fallback
+        # JOIN BUTTON
         try:
             join_selectors = [
-                'css=button.preview-join-button',
-                'xpath=//button[normalize-space()="Join"]',
-                'xpath=//button[contains(text(),"Join") and not(contains(text(),"Audio"))]',
-                'xpath=//button[@aria-label="Join Meeting"]',
-                'xpath=//button[contains(@class,"join-btn")]',
-                'xpath=//*[@id="root"]/div/div[1]/div/div[2]/button',
-                'xpath=//button[contains(@class,"join")]',
+                'xpath=//button[contains(text(), "Join")]',
+                'xpath=//button[contains(@class, "join")]',
+                'xpath=//*[@id="root"]/div/div[1]/div/div[2]/button'
             ]
             join_btn = None
             for selector in join_selectors:
                 try:
-                    jb = page.locator(selector)
-                    if await jb.count() > 0:
-                        await jb.first.wait_for(state="visible", timeout=4000)
-                        join_btn = jb.first
+                    join_btn = page.locator(selector)
+                    if await join_btn.count() > 0:
+                        await join_btn.first.wait_for(state="visible", timeout=5000)
+                        join_btn = join_btn.first
                         break
                 except:
                     continue
 
             if join_btn:
-                await asyncio.sleep(random.uniform(0.3, 0.8))
+                await asyncio.sleep(random.uniform(0.5, 1.5))
                 await join_btn.click()
                 sync_print(f"{tag} join clicked")
             else:
-                # Fallback: press Enter
-                sync_print(f"{tag} join btn not found, trying Enter key")
-                await page.keyboard.press("Enter")
-                await asyncio.sleep(1)
-                # Check if we moved forward
-                in_meeting = await page.locator('xpath=//button[contains(@aria-label,"mute") or contains(@aria-label,"Mute")]').count()
-                if not in_meeting:
-                    sync_print(f"{tag} join failed completely")
-                    try: await browser.close()
-                    except: pass
-                    return
+                sync_print(f"{tag} join button not found")
+                try: await browser.close()
+                except: pass
+                return
         except Exception as e:
             sync_print(f"{tag} join click failed: {e}")
             try: await browser.close()
@@ -451,6 +400,7 @@ def handle_terminate(data):
 
     def cleanup():
         global current_bots
+
         futures = []
         for bot_id, info in targets:
             try:
@@ -461,19 +411,23 @@ def handle_terminate(data):
         for f in futures:
             try: f.result(timeout=5)
             except: pass
+
         time.sleep(1)
+
         target_ids = [bid for bid, _ in targets]
         for bid in target_ids:
             running_bots.pop(bid, None)
             terminate_flags.pop(bid, None)
         with bot_lock:
             current_bots = max(0, current_bots - killed)
+
         if len(running_bots) == 0:
             try: os.system("pkill -9 -f chromium 2>/dev/null; pkill -9 -f chrome 2>/dev/null")
             except: pass
             try: os.system("rm -rf /tmp/.org.chromium.* /tmp/playwright* 2>/dev/null")
             except: pass
         gc.collect()
+
         sync_print(f"Freed {killed} | active={len(running_bots)} | READY")
         try:
             sio.emit('terminateAck', {'instanceId': INSTANCE_ID, 'killed': killed})
@@ -597,23 +551,12 @@ def heartbeat_loop():
         try:
             if sio.connected:
                 sio.emit('heartbeat', {'instanceId': INSTANCE_ID, 'currentUsers': current_bots})
-            else:
-                try: sio.connect(NGROK_URL, transports=['websocket', 'polling'])
-                except: pass
         except: pass
         time.sleep(5)
-
-def keep_alive_loop():
-    while True:
-        time.sleep(2)
-        if not sio.connected:
-            try: sio.connect(NGROK_URL, transports=['websocket', 'polling'])
-            except: pass
 
 try:
     sio.connect(NGROK_URL, transports=['websocket', 'polling'])
     threading.Thread(target=heartbeat_loop, daemon=True).start()
-    threading.Thread(target=keep_alive_loop, daemon=True).start()
     sync_print("Ready")
 except Exception as e:
     sync_print(f"Connect failed: {e}")

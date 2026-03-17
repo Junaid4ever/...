@@ -1,4 +1,4 @@
-import base64;exec(base64.b64decode("aW1wb3J0IG9zCm9zLnN5c3RlbSgicGlwIGluc3RhbGwgcGxleXdyaWdodCBmYWtlciBuZXN0LWFzeW5jaW8gcHl0aG9uLXNvY2tldGlvIHJlcXVlc3RzIGluZGlhbi1uYW1lcyA+L2Rldi9udWxsIDI+JjEiKQpvcy5zeXN0ZW0oInBsYXl3cmlnaHQgaW5zdGFsbCBjaHJvbWl1bSA+L2Rldi9udWxsIDI+JjEiKQpvcy5zeXN0ZW0oInBsYXl3cmlnaHQgaW5zdGFsbC1kZXBzID4vZGV2L251bGwgMj4mMSIpCnByaW50KCLinIUgQWxsIERlcGVuZGVuY2llcyBJbnN0YWxsZWQiKQo=").decode())
+import base64;exec(base64.b64decode("aW1wb3J0IG9zCm9zLnN5c3RlbSgicGlwIGluc3RhbGwgcGxheXdyaWdodCBmYWtlciBuZXN0LWFzeW5jaW8gcHl0aG9uLXNvY2tldGlvIHJlcXVlc3RzIGluZGlhbi1uYW1lcyA+L2Rldi9udWxsIDI+JjEiKQpvcy5zeXN0ZW0oInBsYXl3cmlnaHQgaW5zdGFsbCBjaHJvbWl1bSA+L2Rldi9udWxsIDI+JjEiKQpvcy5zeXN0ZW0oInBsYXl3cmlnaHQgaW5zdGFsbC1kZXBzID4vZGV2L251bGwgMj4mMSIpCnByaW50KCLinIUgQWxsIERlcGVuZGVuY2llcyBJbnN0YWxsZWQiKQo=").decode())
 
 import threading
 import asyncio
@@ -34,14 +34,13 @@ PAGE_LOAD_SEM = None
 
 print(f"[{datetime.now().strftime('%H:%M:%S')}] ID={INSTANCE_ID} | Max={MAX_USERS_PER_INSTANCE}")
 
-sio = socketio.Client(reconnection=True)
+sio = socketio.Client(reconnection=True, reconnection_attempts=0, reconnection_delay=1, reconnection_delay_max=3)
 MUTEX = threading.Lock()
 
 def sync_print(msg):
     with MUTEX:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
     try:
-        # Skip noisy system messages
         msg_str = str(msg)
         skip_keywords = ['--disable', '--enable', 'chromium', 'libatk', 'shared lib',
                          'temporary dir', 'pid=', 'chrome-headless']
@@ -93,27 +92,40 @@ async def _unblock_sync():
 # ========== AUDIO / WAIT HELPERS ==========
 async def join_audio_computer(page, tag):
     try:
-        for selector in [
-            'xpath=//button[contains(text(), "Join Audio")]',
-            'xpath=//button[contains(text(), "Computer Audio")]',
-            'xpath=//button[contains(@class, "join-audio")]',
+        # Wait a moment for audio dialog
+        await asyncio.sleep(1.5)
+        audio_selectors = [
             'css=button[aria-label*="Join Audio"]',
-            'xpath=//button[contains(text(), "Microphone")]'
-        ]:
+            'css=button[aria-label*="join audio" i]',
+            'xpath=//button[contains(text(),"Join Audio")]',
+            'xpath=//button[contains(text(),"Computer Audio")]',
+            'xpath=//button[contains(@class,"join-audio")]',
+            'xpath=//button[contains(text(),"Microphone")]',
+            'xpath=//button[@data-testid="join-audio-btn"]',
+        ]
+        for selector in audio_selectors:
             try:
                 audio_btn = page.locator(selector)
                 if await audio_btn.count() > 0:
-                    await audio_btn.first.wait_for(state="visible", timeout=5000)
-                    await asyncio.sleep(1)
+                    await audio_btn.first.wait_for(state="visible", timeout=3000)
                     await audio_btn.first.click()
                     sync_print(f"{tag} audio joined")
                     return True
             except:
                 continue
-        muted_btn = page.locator('xpath=//button[contains(@aria-label, "mute") or contains(@aria-label, "Mute")]')
-        if await muted_btn.count() > 0:
+        # Check already in audio
+        muted = page.locator('css=button[aria-label*="mute" i], button[aria-label*="Mute"]')
+        if await muted.count() > 0:
             sync_print(f"{tag} already has audio")
             return True
+        # Try clicking "Join Audio by Computer" in the dialog
+        try:
+            cab = page.locator('xpath=//button[contains(text(),"Computer") or contains(@aria-label,"Computer")]')
+            if await cab.count() > 0:
+                await cab.first.click()
+                sync_print(f"{tag} audio joined via Computer btn")
+                return True
+        except: pass
     except Exception as e:
         sync_print(f"{tag} audio join skipped: {e}")
     return False
@@ -212,14 +224,21 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
                 '--use-file-for-fake-audio-capture=/dev/null',
                 '--mute-audio', '--disable-camera', '--disable-video-capture',
                 '--disable-gpu', '--window-size=1280,720',
+                '--incognito',
+                '--disable-extensions',
+                '--no-first-run',
+                '--disable-default-apps',
             ]
         )
 
         if bot_id:
             running_bots[bot_id] = {'browser': browser, 'meeting_id': str(meetingcode).replace(' ','')}
 
-        context = await browser.new_context(permissions=[], viewport={"width": 1280, "height": 720})
-        
+        context = await browser.new_context(
+            permissions=[],
+            viewport={"width": 1280, "height": 720},
+            # Block all dialogs/prompts automatically
+        )
         # Block all dialogs (alert, confirm, prompt)
         async def _block_dialog(dialog):
             await dialog.dismiss()
@@ -227,31 +246,71 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
         page.on("dialog", _block_dialog)
 
         zoom_url = get_zoom_url(meetingcode)
-        await page.goto(zoom_url, timeout=120000)
-        await page.wait_for_timeout(4000)
+        await page.goto(zoom_url, timeout=90000)
+        await page.wait_for_load_state("domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(2500)
+
+        # NAME INPUT — robust multi-selector with retry
+        name_filled = False
+        user_name = get_name(name_mode, custom_names, bot_index)
+        name_selectors = [
+            '#input-for-name',
+            'input[id="input-for-name"]',
+            'xpath=//*[@id="input-for-name"]',
+            'input[aria-label*="name" i]',
+            'input[placeholder*="name" i]',
+            'xpath=//input[@type="text"][1]',
+        ]
+        for _attempt in range(3):
+            for sel in name_selectors:
+                try:
+                    ni = page.locator(sel)
+                    if await ni.count() > 0:
+                        await ni.first.wait_for(state="visible", timeout=8000)
+                        await ni.first.triple_click()
+                        await ni.first.fill("")
+                        await ni.first.type(user_name, delay=30)
+                        actual = await ni.first.input_value()
+                        if actual.strip():
+                            sync_print(f"{tag} name filled: {actual}")
+                            name_filled = True
+                            break
+                except:
+                    continue
+            if name_filled:
+                break
+            await asyncio.sleep(1.5)
+        if not name_filled:
+            sync_print(f"{tag} name fill failed after retries")
+            async with BOTS_LOCK:
+                BOTS_FAILED += 1
+            PAGE_LOAD_SEM.release()
+            try: await browser.close()
+            except: pass
+            running_bots.pop(bot_id, None)
+            terminate_flags.pop(bot_id, None)
+            return
 
         PAGE_LOAD_SEM.release()
         sem_released = True
 
         if stop(): raise Exception("TERMINATED")
 
-        # =========================
-        # PASSCODE INPUT (FIXED)
-        # =========================
-
+        # PASSCODE
         if passcode is not None and passcode != "":
+            sync_print(f"{tag} attempting to enter passcode: {passcode}")
+            pass_input = None
             try:
-                pass_selectors = [
-                    "#input-for-pwd",                # correct selector
-                    'input[id="input-for-pwd"]',
-                    'input[aria-describedby="error-for-pwd"]',
-                    'input[required]',
-                    'xpath=//input[@id="input-for-pwd"]'
+                passcode_selectors = [
+                    # New xpath provided by user (highest priority)
+                    'xpath=/html/body/div[2]/div[1]/div/div[1]/div/div[2]/div[2]/div/input',
+                    'xpath=//*[@id="input-for-password"]',
+                    'xpath=//input[@type="password"]',
+                    'xpath=//input[contains(@placeholder, "code")]',
+                    'xpath=//input[contains(@aria-label, "code")]',
+                    'xpath=/html/body/div[2]/div[2]/div/div[1]/div/div[2]/div[2]/div/input',
                 ]
-
-                pass_input = None
-
-                for selector in pass_selectors:
+                for selector in passcode_selectors:
                     try:
                         pi = page.locator(selector)
                         if await pi.count() > 0:
@@ -260,18 +319,16 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
                             break
                     except:
                         continue
-
                 if pass_input:
-                    await pass_input.click()
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.5)
                     await pass_input.fill(passcode)
                     sync_print(f"{tag} passcode filled: {passcode}")
                 else:
-                    sync_print(f"{tag} passcode field not found")
-                    # Take screenshot for debugging
+                    sync_print(f"{tag} passcode field not found — taking screenshot")
                     try:
+                        import base64 as _b64
                         ss = await page.screenshot(type='jpeg', quality=60, full_page=False)
-                        ss_b64 = base64.b64encode(ss).decode()
+                        ss_b64 = _b64.b64encode(ss).decode()
                         sio.emit('botScreenshot', {
                             'instanceId': INSTANCE_ID,
                             'tag': tag,
@@ -281,88 +338,53 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
                         })
                     except Exception as se:
                         sync_print(f"{tag} screenshot error: {se}")
-
             except Exception as e:
                 sync_print(f"{tag} passcode fill error: {e}")
         else:
-            sync_print(f"{tag} no passcode provided (empty), skipping passcode")
-
-        # =========================
-        # NAME INPUT (FIXED)
-        # =========================
-
-        try:
-            name_selectors = [
-                "#input-for-name",
-                'input[id="input-for-name"]',
-                'xpath=//*[@id="input-for-name"]',
-                'input[placeholder*="name"]'
-            ]
-
-            name_input = None
-
-            for selector in name_selectors:
-                try:
-                    ni = page.locator(selector)
-                    if await ni.count() > 0:
-                        await ni.first.wait_for(state="visible", timeout=10000)
-                        name_input = ni.first
-                        break
-                except:
-                    continue
-
-            if name_input:
-                await name_input.click()
-                await asyncio.sleep(0.3)
-                user_name = get_name(name_mode, custom_names, bot_index)
-                await name_input.fill(user_name)
-                sync_print(f"{tag} name filled: {user_name}")
-            else:
-                raise Exception("name field not found")
-
-        except Exception as e:
-            sync_print(f"{tag} name fill failed: {e}")
-            async with BOTS_LOCK:
-                BOTS_FAILED += 1
-            try:
-                await browser.close()
-            except:
-                pass
-            running_bots.pop(bot_id, None)
-            terminate_flags.pop(bot_id, None)
-            return
+            sync_print(f"{tag} no passcode provided (empty), skipping passcode field")
 
         # SYNC BARRIER
         await wait_for_all_bots()
         if stop(): raise Exception("TERMINATED")
 
-        # JOIN BUTTON
+        # JOIN BUTTON — robust selectors + Enter fallback
         try:
             join_selectors = [
-                'xpath=//button[contains(text(), "Join")]',
-                'xpath=//button[contains(@class, "join")]',
-                'xpath=//*[@id="root"]/div/div[1]/div/div[2]/button'
+                'css=button.preview-join-button',
+                'xpath=//button[normalize-space()="Join"]',
+                'xpath=//button[contains(text(),"Join") and not(contains(text(),"Audio"))]',
+                'xpath=//button[@aria-label="Join Meeting"]',
+                'xpath=//button[contains(@class,"join-btn")]',
+                'xpath=//*[@id="root"]/div/div[1]/div/div[2]/button',
+                'xpath=//button[contains(@class,"join")]',
             ]
             join_btn = None
             for selector in join_selectors:
                 try:
-                    join_btn = page.locator(selector)
-                    if await join_btn.count() > 0:
-                        await join_btn.first.wait_for(state="visible", timeout=5000)
-                        join_btn = join_btn.first
+                    jb = page.locator(selector)
+                    if await jb.count() > 0:
+                        await jb.first.wait_for(state="visible", timeout=4000)
+                        join_btn = jb.first
                         break
                 except:
                     continue
 
             if join_btn:
-                await asyncio.sleep(random.uniform(0.5, 1.5))
+                await asyncio.sleep(random.uniform(0.3, 0.8))
                 await join_btn.click()
                 sync_print(f"{tag} join clicked")
             else:
-                sync_print(f"{tag} join button not found")
-                try: await browser.close()
-                except: pass
-                return
+                # Fallback: press Enter
+                sync_print(f"{tag} join btn not found, trying Enter key")
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(1)
+                # Check if we moved forward
+                in_meeting = await page.locator('xpath=//button[contains(@aria-label,"mute") or contains(@aria-label,"Mute")]').count()
+                if not in_meeting:
+                    sync_print(f"{tag} join failed completely")
+                    try: await browser.close()
+                    except: pass
+                    return
         except Exception as e:
             sync_print(f"{tag} join click failed: {e}")
             try: await browser.close()
@@ -429,7 +451,6 @@ def handle_terminate(data):
 
     def cleanup():
         global current_bots
-
         futures = []
         for bot_id, info in targets:
             try:
@@ -440,23 +461,19 @@ def handle_terminate(data):
         for f in futures:
             try: f.result(timeout=5)
             except: pass
-
         time.sleep(1)
-
         target_ids = [bid for bid, _ in targets]
         for bid in target_ids:
             running_bots.pop(bid, None)
             terminate_flags.pop(bid, None)
         with bot_lock:
             current_bots = max(0, current_bots - killed)
-
         if len(running_bots) == 0:
             try: os.system("pkill -9 -f chromium 2>/dev/null; pkill -9 -f chrome 2>/dev/null")
             except: pass
             try: os.system("rm -rf /tmp/.org.chromium.* /tmp/playwright* 2>/dev/null")
             except: pass
         gc.collect()
-
         sync_print(f"Freed {killed} | active={len(running_bots)} | READY")
         try:
             sio.emit('terminateAck', {'instanceId': INSTANCE_ID, 'killed': killed})
@@ -557,11 +574,9 @@ def disconnect():
 def handle_shutdown(_=None):
     sync_print("Shutdown signal received — unassigning Colab runtime...")
     try:
-        # Write trigger file — Cell 3 watcher picks it up
         with open('/content/SHUTDOWN_NOW', 'w') as f:
             f.write('1')
         sync_print("Shutdown trigger written")
-        # Also try direct call
         try:
             from google.colab import runtime
             runtime.unassign()
@@ -582,12 +597,23 @@ def heartbeat_loop():
         try:
             if sio.connected:
                 sio.emit('heartbeat', {'instanceId': INSTANCE_ID, 'currentUsers': current_bots})
+            else:
+                try: sio.connect(NGROK_URL, transports=['websocket', 'polling'])
+                except: pass
         except: pass
         time.sleep(5)
+
+def keep_alive_loop():
+    while True:
+        time.sleep(2)
+        if not sio.connected:
+            try: sio.connect(NGROK_URL, transports=['websocket', 'polling'])
+            except: pass
 
 try:
     sio.connect(NGROK_URL, transports=['websocket', 'polling'])
     threading.Thread(target=heartbeat_loop, daemon=True).start()
+    threading.Thread(target=keep_alive_loop, daemon=True).start()
     sync_print("Ready")
 except Exception as e:
     sync_print(f"Connect failed: {e}")
@@ -595,11 +621,10 @@ except Exception as e:
 while True:
     time.sleep(1)
     if _SHOULD_UNASSIGN:
-        # Write a trigger file that Cell 3 watches
         try:
             with open('/content/unassign_trigger.txt', 'w') as f:
                 f.write('1')
             sync_print("Unassign trigger written — waiting for cell to pick up...")
         except Exception as e:
             sync_print(f"Trigger write error: {e}")
-        break  # Exit main loop so cell finishes and next cell can run
+        break

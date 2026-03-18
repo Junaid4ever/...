@@ -20,7 +20,7 @@ fake_en = Faker('en_US')
 # ========== CONFIG ==========
 import argparse as _ap
 _parser = _ap.ArgumentParser()
-_parser.add_argument('--server', type=str, default="https://extensional-christene-intensionally.ngrok-free.dev")
+_parser.add_argument('--server', type=str, default="https://emails-clan-emma-achievements.trycloudflare.com")
 _args, _ = _parser.parse_known_args()
 NGROK_URL = _args.server
 INSTANCE_ID = f"colab-{int(time.time()*1000)%100000}"

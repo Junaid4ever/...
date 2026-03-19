@@ -7,14 +7,16 @@ from faker import Faker
 from playwright.async_api import async_playwright
 import nest_asyncio, socketio
 
+# nest_asyncio must be applied before uvloop takes over
+nest_asyncio.apply()
+
 try:
     import uvloop
-    uvloop.install()
-    print("✓ uvloop active")
+    print("✓ uvloop active (loop-level, not global)")
+    _USE_UVLOOP = True
 except (ImportError, NotImplementedError):
     print("uvloop not available, using default asyncio")
-
-nest_asyncio.apply()
+    _USE_UVLOOP = False
 fake_en = Faker('en_US')
 
 # ========== CONFIG ==========
@@ -33,8 +35,9 @@ PAGE_LOAD_SEM = None
 
 # ── Persistent event loop ──
 try:
-    _bot_loop = uvloop.new_event_loop()
-except (NameError, NotImplementedError):
+    import uvloop as _uv
+    _bot_loop = _uv.new_event_loop()
+except (ImportError, NameError, NotImplementedError):
     _bot_loop = asyncio.new_event_loop()
 threading.Thread(target=_bot_loop.run_forever, daemon=True).start()
 

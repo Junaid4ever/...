@@ -225,18 +225,43 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
         page.on("dialog", _block_dialog)
 
         zoom_url = get_zoom_url(meetingcode)
-        await page.goto(zoom_url, timeout=60000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(1500)
-
-        # NAME INPUT
+        # networkidle ensures Zoom's JS form is rendered (not just HTML skeleton)
         try:
-            name_input = page.locator('xpath=//*[@id="input-for-name"]')
-            await name_input.wait_for(state="visible", timeout=30000)
-            user_name = get_name(name_mode, custom_names, bot_index)
-            await name_input.fill(user_name)
-            sync_print(f"{tag} name filled: {user_name}")
-        except Exception as e:
-            sync_print(f"{tag} name fill failed: {e}")
+            await page.goto(zoom_url, timeout=60000, wait_until="networkidle")
+        except:
+            # fallback if networkidle times out — page may still be usable
+            try: await page.goto(zoom_url, timeout=60000, wait_until="domcontentloaded")
+            except: pass
+        await page.wait_for_timeout(1000)
+
+        # NAME INPUT — try multiple selectors with retry
+        NAME_SELECTORS = [
+            'xpath=//*[@id="input-for-name"]',
+            '#input-for-name',
+            'input[placeholder*="name" i]',
+            'input[placeholder*="naam" i]',
+            'xpath=/html/body/div[2]/div[1]/div/div[1]/div/div[2]/div[3]/div/input',
+            'xpath=//input[contains(@id,"name")]',
+        ]
+        name_filled = False
+        user_name = get_name(name_mode, custom_names, bot_index)
+        for attempt in range(3):  # retry 3 times (page may still be loading)
+            for sel in NAME_SELECTORS:
+                try:
+                    ni = page.locator(sel)
+                    if await ni.count() > 0:
+                        await ni.first.wait_for(state="visible", timeout=8000)
+                        await ni.first.fill(user_name, timeout=5000)
+                        name_filled = True
+                        sync_print(f"{tag} name filled: {user_name}")
+                        break
+                except: continue
+            if name_filled: break
+            sync_print(f"{tag} name not found yet (attempt {attempt+1}/3), retrying...")
+            await page.wait_for_timeout(3000)  # wait 3s and retry
+
+        if not name_filled:
+            sync_print(f"{tag} name fill failed — skipping bot")
             async with BOTS_LOCK:
                 BOTS_FAILED += 1
             PAGE_LOAD_SEM.release()

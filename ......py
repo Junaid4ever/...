@@ -491,11 +491,22 @@ def handle_command(data):
         except: pass
 
     with bot_lock:
+        # Self-correct: trust the REAL running bot count, not just the manual counter.
+        # This prevents ghost/stuck counters from permanently blocking launches.
+        real_active = len(running_bots)
+        if real_active < current_bots:
+            current_bots = real_active  # heal drift
         if current_bots + users <= MAX_USERS_PER_INSTANCE:
             current_bots += users
             threading.Thread(target=run_automation, daemon=True).start()
         else:
-            sync_print(f"Capacity full ({current_bots}/{MAX_USERS_PER_INSTANCE})")
+            # Try healing once more from reality before rejecting
+            current_bots = len(running_bots)
+            if current_bots + users <= MAX_USERS_PER_INSTANCE:
+                current_bots += users
+                threading.Thread(target=run_automation, daemon=True).start()
+            else:
+                sync_print(f"Capacity full ({current_bots}/{MAX_USERS_PER_INSTANCE}) — real active={len(running_bots)}")
 
 # ========== SOCKET EVENTS ==========
 _SHOULD_UNASSIGN = False

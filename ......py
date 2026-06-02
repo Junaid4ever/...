@@ -23,7 +23,7 @@ _parser = _ap.ArgumentParser()
 _parser.add_argument('--server', type=str, default="https://extensional-christene-intensionally.ngrok-free.dev")
 _args, _ = _parser.parse_known_args()
 NGROK_URL = _args.server
-INSTANCE_ID = f"colab-{int(time.time()*1000)%100000}"
+INSTANCE_ID = f"colab-{int(time.time()*1000)%100000}-{random.randint(100,999)}"
 MAX_USERS_PER_INSTANCE = 10
 current_bots = 0
 bot_lock = threading.Lock()
@@ -103,8 +103,8 @@ async def join_audio_computer(page, tag):
             try:
                 audio_btn = page.locator(selector)
                 if await audio_btn.count() > 0:
-                    await audio_btn.first.wait_for(state="visible", timeout=5000)
-                    await asyncio.sleep(1)
+                    await audio_btn.first.wait_for(state="visible", timeout=4000)
+                    await asyncio.sleep(0.3)
                     await audio_btn.first.click()
                     sync_print(f"{tag} audio joined")
                     return True
@@ -212,7 +212,6 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
                 '--use-file-for-fake-audio-capture=/dev/null',
                 '--mute-audio', '--disable-camera', '--disable-video-capture',
                 '--disable-gpu', '--window-size=1280,720',
-                '--incognito', '--no-first-run', '--disable-default-apps',
             ]
         )
 
@@ -220,20 +219,16 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
             running_bots[bot_id] = {'browser': browser, 'meeting_id': str(meetingcode).replace(' ','')}
 
         context = await browser.new_context(permissions=[], viewport={"width": 1280, "height": 720})
-        async def _block_dialog(dialog):
-            await dialog.dismiss()
-        page = await context.new_page()
-        page.on("dialog", _block_dialog)
+        page    = await context.new_page()
 
         zoom_url = get_zoom_url(meetingcode)
-        await page.goto(zoom_url, timeout=120000)
-        await page.wait_for_timeout(4000)
+        await page.goto(zoom_url, timeout=60000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(1500)
 
         # NAME INPUT
         try:
             name_input = page.locator('xpath=//*[@id="input-for-name"]')
             await name_input.wait_for(state="visible", timeout=30000)
-            await asyncio.sleep(1)
             user_name = get_name(name_mode, custom_names, bot_index)
             await name_input.fill(user_name)
             sync_print(f"{tag} name filled: {user_name}")
@@ -253,47 +248,33 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
 
         if stop(): raise Exception("TERMINATED")
 
-        # PASSCODE — robust selectors + screenshot fallback
+        # PASSCODE
         if passcode is not None and passcode != "":
             sync_print(f"{tag} attempting to enter passcode: {passcode}")
-            pass_input = None
             try:
                 passcode_selectors = [
-                    'xpath=/html/body/div[2]/div[1]/div/div[1]/div/div[2]/div[2]/div/input',
-                    'xpath=//*[@id="input-for-password"]',
                     'xpath=//input[@type="password"]',
                     'xpath=//input[contains(@placeholder, "code")]',
                     'xpath=//input[contains(@aria-label, "code")]',
-                    'xpath=/html/body/div[2]/div[2]/div/div[1]/div/div[2]/div[2]/div/input',
+                    'xpath=//*[@id="input-for-password"]',
+                    'xpath=/html/body/div[2]/div[2]/div/div[1]/div/div[2]/div[2]/div/input'
                 ]
+                pass_input = None
                 for selector in passcode_selectors:
                     try:
-                        pi = page.locator(selector)
-                        if await pi.count() > 0:
-                            await pi.first.wait_for(state="visible", timeout=8000)
-                            pass_input = pi.first
+                        pass_input = page.locator(selector)
+                        if await pass_input.count() > 0:
+                            await pass_input.first.wait_for(state="visible", timeout=5000)
+                            pass_input = pass_input.first
                             break
                     except:
                         continue
                 if pass_input:
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(1.5)
                     await pass_input.fill(passcode)
                     sync_print(f"{tag} passcode filled: {passcode}")
                 else:
-                    sync_print(f"{tag} passcode field not found — taking screenshot")
-                    try:
-                        import base64 as _b64
-                        ss = await page.screenshot(type='jpeg', quality=60, full_page=False)
-                        ss_b64 = _b64.b64encode(ss).decode()
-                        sio.emit('botScreenshot', {
-                            'instanceId': INSTANCE_ID,
-                            'tag': tag,
-                            'meetingId': str(meetingcode).replace(' ',''),
-                            'screenshot': ss_b64,
-                            'reason': 'passcode field not found'
-                        })
-                    except Exception as se:
-                        sync_print(f"{tag} screenshot error: {se}")
+                    sync_print(f"{tag} no passcode field found")
             except Exception as e:
                 sync_print(f"{tag} passcode fill error: {e}")
         else:
@@ -322,7 +303,7 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
                     continue
 
             if join_btn:
-                await asyncio.sleep(random.uniform(0.5, 1.5))
+                await asyncio.sleep(random.uniform(0.1, 0.3))
                 await join_btn.click()
                 sync_print(f"{tag} join clicked")
             else:
@@ -466,7 +447,7 @@ def handle_command(data):
         BOTS_READY    = 0
         BOTS_FAILED   = 0
         READY_TO_JOIN = asyncio.Event()
-        PAGE_LOAD_SEM = asyncio.Semaphore(2)
+        PAGE_LOAD_SEM = asyncio.Semaphore(100)
 
         tasks = [
             loop.create_task(

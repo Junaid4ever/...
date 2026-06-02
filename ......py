@@ -20,10 +20,10 @@ fake_en = Faker('en_US')
 # ========== CONFIG ==========
 import argparse as _ap
 _parser = _ap.ArgumentParser()
-_parser.add_argument('--server', type=str, default="https://extensional-christene-intensionally.ngrok-free.dev")
+_parser.add_argument('--server', type=str, default="http://72.61.239.29:5000")
 _args, _ = _parser.parse_known_args()
 NGROK_URL = _args.server
-INSTANCE_ID = f"colab-{int(time.time()*1000)%100000}-{random.randint(100,999)}"
+INSTANCE_ID = f"colab-{int(time.time()*1000)%100000}"
 MAX_USERS_PER_INSTANCE = 10
 current_bots = 0
 bot_lock = threading.Lock()
@@ -41,7 +41,6 @@ def sync_print(msg):
     with MUTEX:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
     try:
-        # Skip noisy system messages
         msg_str = str(msg)
         skip_keywords = ['--disable', '--enable', 'chromium', 'libatk', 'shared lib',
                          'temporary dir', 'pid=', 'chrome-headless']
@@ -212,6 +211,7 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
                 '--use-file-for-fake-audio-capture=/dev/null',
                 '--mute-audio', '--disable-camera', '--disable-video-capture',
                 '--disable-gpu', '--window-size=1280,720',
+                '--incognito', '--no-first-run', '--disable-default-apps',
             ]
         )
 
@@ -219,7 +219,10 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
             running_bots[bot_id] = {'browser': browser, 'meeting_id': str(meetingcode).replace(' ','')}
 
         context = await browser.new_context(permissions=[], viewport={"width": 1280, "height": 720})
-        page    = await context.new_page()
+        async def _block_dialog(dialog):
+            await dialog.dismiss()
+        page = await context.new_page()
+        page.on("dialog", _block_dialog)
 
         zoom_url = get_zoom_url(meetingcode)
         await page.goto(zoom_url, timeout=60000, wait_until="domcontentloaded")
@@ -248,37 +251,27 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
 
         if stop(): raise Exception("TERMINATED")
 
-        # PASSCODE
+        # PASSCODE — simple robust selectors (fixed: #input-for-pwd first, fill with timeout)
         if passcode is not None and passcode != "":
-            sync_print(f"{tag} attempting to enter passcode: {passcode}")
-            try:
-                passcode_selectors = [
-                    'xpath=//input[@type="password"]',
-                    'xpath=//input[contains(@placeholder, "code")]',
-                    'xpath=//input[contains(@aria-label, "code")]',
-                    'xpath=//*[@id="input-for-password"]',
-                    'xpath=/html/body/div[2]/div[2]/div/div[1]/div/div[2]/div[2]/div/input'
-                ]
-                pass_input = None
-                for selector in passcode_selectors:
-                    try:
-                        pass_input = page.locator(selector)
-                        if await pass_input.count() > 0:
-                            await pass_input.first.wait_for(state="visible", timeout=5000)
-                            pass_input = pass_input.first
-                            break
-                    except:
-                        continue
-                if pass_input:
-                    await asyncio.sleep(1.5)
-                    await pass_input.fill(passcode)
-                    sync_print(f"{tag} passcode filled: {passcode}")
-                else:
-                    sync_print(f"{tag} no passcode field found")
-            except Exception as e:
-                sync_print(f"{tag} passcode fill error: {e}")
+            sync_print(f"{tag} entering passcode...")
+            filled = False
+            for selector in ['#input-for-pwd', '#input-for-password',
+                             'input[type="password"]',
+                             'xpath=//*[@id="input-for-pwd"]']:
+                try:
+                    pi = page.locator(selector)
+                    if await pi.count() > 0:
+                        await pi.first.wait_for(state="visible", timeout=5000)
+                        await pi.first.fill(passcode, timeout=5000)
+                        sync_print(f"{tag} passcode filled")
+                        filled = True
+                        break
+                except:
+                    continue
+            if not filled:
+                sync_print(f"{tag} passcode field not found (may not be required)")
         else:
-            sync_print(f"{tag} no passcode provided (empty), skipping passcode field")
+            sync_print(f"{tag} no passcode provided, skipping")
 
         # SYNC BARRIER
         await wait_for_all_bots()
@@ -316,6 +309,28 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
             try: await browser.close()
             except: pass
             return
+
+        # PASSCODE POPUP — appears AFTER join click in some meetings
+        if passcode is not None and passcode != "":
+            try:
+                await page.wait_for_timeout(1200)
+                for selector in ['#input-for-pwd', '#input-for-password', 'input[type="password"]']:
+                    try:
+                        pi = page.locator(selector)
+                        if await pi.count() > 0 and await pi.first.is_visible():
+                            await pi.first.fill(passcode, timeout=4000)
+                            for cs in ['xpath=//button[contains(text(), "Join Meeting")]',
+                                       'xpath=//button[contains(text(), "Join")]',
+                                       'xpath=//button[@type="submit"]']:
+                                try:
+                                    cb = page.locator(cs)
+                                    if await cb.count() > 0:
+                                        await cb.first.click(); break
+                                except: continue
+                            sync_print(f"{tag} passcode popup filled")
+                            break
+                    except: continue
+            except: pass
 
         await wait_for_meeting_to_start(page, tag)
         await wait_for_waiting_room(page, tag)
@@ -505,11 +520,9 @@ def disconnect():
 def handle_shutdown(_=None):
     sync_print("Shutdown signal received — unassigning Colab runtime...")
     try:
-        # Write trigger file — Cell 3 watcher picks it up
         with open('/content/SHUTDOWN_NOW', 'w') as f:
             f.write('1')
         sync_print("Shutdown trigger written")
-        # Also try direct call
         try:
             from google.colab import runtime
             runtime.unassign()
@@ -543,11 +556,10 @@ except Exception as e:
 while True:
     time.sleep(1)
     if _SHOULD_UNASSIGN:
-        # Write a trigger file that Cell 3 watches
         try:
             with open('/content/unassign_trigger.txt', 'w') as f:
                 f.write('1')
             sync_print("Unassign trigger written — waiting for cell to pick up...")
         except Exception as e:
             sync_print(f"Trigger write error: {e}")
-        break  # Exit main loop so cell finishes and next cell can run
+        break

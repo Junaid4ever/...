@@ -20,11 +20,11 @@ fake_en = Faker('en_US')
 # ========== CONFIG ==========
 import argparse as _ap
 _parser = _ap.ArgumentParser()
-_parser.add_argument('--server', type=str, default="https://extensional-christene-intensionally.ngrok-free.dev")
+_parser.add_argument('--server', type=str, default="http://72.61.239.29:5000")
 _args, _ = _parser.parse_known_args()
 NGROK_URL = _args.server
 INSTANCE_ID = f"colab-{int(time.time()*1000)%100000}"
-MAX_USERS_PER_INSTANCE = 10
+MAX_USERS_PER_INSTANCE = 20
 current_bots = 0
 bot_lock = threading.Lock()
 running_bots = {}
@@ -41,7 +41,6 @@ def sync_print(msg):
     with MUTEX:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
     try:
-        # Skip noisy system messages
         msg_str = str(msg)
         skip_keywords = ['--disable', '--enable', 'chromium', 'libatk', 'shared lib',
                          'temporary dir', 'pid=', 'chrome-headless']
@@ -204,22 +203,73 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
         p_inst = async_playwright()
         p = await p_inst.__aenter__()
 
+        # ULTRA OPTIMIZED browser args — minimum RAM/CPU per instance
         browser = await p.chromium.launch(
             headless=headless,
             args=[
-                '--no-sandbox', '--disable-dev-shm-usage',
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
                 '--use-fake-device-for-media-stream',
                 '--use-file-for-fake-audio-capture=/dev/null',
-                '--mute-audio', '--disable-camera', '--disable-video-capture',
-                '--disable-gpu', '--window-size=1280,720',
-                '--incognito', '--no-first-run', '--disable-default-apps',
+                '--mute-audio',
+                '--disable-camera',
+                '--disable-video-capture',
+                '--disable-gpu',
+                '--disable-software-rasterizer',
+                '--window-size=800,600',          # smaller window = less RAM
+                '--incognito',
+                '--no-first-run',
+                '--disable-default-apps',
+                '--disable-extensions',
+                '--disable-plugins',
+                '--disable-images',               # no images = less memory/network
+                '--disable-javascript-harmony-shipping',
+                '--disable-background-networking',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-breakpad',
+                '--disable-client-side-phishing-detection',
+                '--disable-component-update',
+                '--disable-default-apps',
+                '--disable-domain-reliability',
+                '--disable-features=AudioServiceOutOfProcess,TranslateUI,BlinkGenPropertyTrees',
+                '--disable-hang-monitor',
+                '--disable-ipc-flooding-protection',
+                '--disable-popup-blocking',
+                '--disable-prompt-on-repost',
+                '--disable-renderer-backgrounding',
+                '--disable-sync',
+                '--disable-translate',
+                '--metrics-recording-only',
+                '--no-default-browser-check',
+                '--no-pings',
+                '--password-store=basic',
+                '--use-mock-keychain',
+                '--hide-scrollbars',
+                '--media-cache-size=1',
+                '--disk-cache-size=1',
+                '--aggressive-cache-discard',
+                '--memory-pressure-off',
+                '--js-flags=--max-old-space-size=128',  # limit JS heap to 128MB per tab
             ]
         )
 
         if bot_id:
             running_bots[bot_id] = {'browser': browser, 'meeting_id': str(meetingcode).replace(' ','')}
 
-        context = await browser.new_context(permissions=[], viewport={"width": 1280, "height": 720})
+        context = await browser.new_context(
+            permissions=[],
+            viewport={"width": 800, "height": 600},
+            # Block heavy resources to save RAM/bandwidth
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
+        )
+
+        # Block images, fonts, media to save RAM
+        await context.route("**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf,otf,mp4,webm,mp3,wav}", lambda r: r.abort())
+        await context.route("**/analytics**", lambda r: r.abort())
+        await context.route("**/tracking**", lambda r: r.abort())
+        await context.route("**/telemetry**", lambda r: r.abort())
+
         async def _block_dialog(dialog):
             await dialog.dismiss()
         page = await context.new_page()
@@ -229,16 +279,34 @@ async def start(tag, wait_time, meetingcode, passcode, headless,
         await page.goto(zoom_url, timeout=120000)
         await page.wait_for_timeout(4000)
 
-        # NAME INPUT
-        try:
-            name_input = page.locator('xpath=//*[@id="input-for-name"]')
-            await name_input.wait_for(state="visible", timeout=30000)
-            await asyncio.sleep(1)
-            user_name = get_name(name_mode, custom_names, bot_index)
-            await name_input.fill(user_name)
-            sync_print(f"{tag} name filled: {user_name}")
-        except Exception as e:
-            sync_print(f"{tag} name fill failed: {e}")
+        # NAME INPUT — multi-selector with retry
+        NAME_SELECTORS = [
+            'xpath=//*[@id="input-for-name"]',
+            '#input-for-name',
+            'input[placeholder*="name" i]',
+            'xpath=/html/body/div[2]/div[1]/div/div[1]/div/div[2]/div[3]/div/input',
+            'xpath=//input[contains(@id,"name")]',
+        ]
+        name_filled = False
+        user_name = get_name(name_mode, custom_names, bot_index)
+        for attempt in range(3):
+            for sel in NAME_SELECTORS:
+                try:
+                    ni = page.locator(sel)
+                    if await ni.count() > 0:
+                        await ni.first.wait_for(state="visible", timeout=8000)
+                        await asyncio.sleep(1)
+                        await ni.first.fill(user_name, timeout=5000)
+                        name_filled = True
+                        sync_print(f"{tag} name filled: {user_name}")
+                        break
+                except: continue
+            if name_filled: break
+            sync_print(f"{tag} name retry {attempt+1}/3...")
+            await page.wait_for_timeout(3000)
+
+        if not name_filled:
+            sync_print(f"{tag} name fill failed — skipping")
             async with BOTS_LOCK:
                 BOTS_FAILED += 1
             PAGE_LOAD_SEM.release()
@@ -439,6 +507,14 @@ def handle_terminate(data):
 def handle_command(data):
     global current_bots, BOTS_TOTAL, BOTS_READY, BOTS_FAILED, READY_TO_JOIN, _bot_loop, PAGE_LOAD_SEM
 
+    # INSTANT print + ack — fired before any processing so it's visible immediately
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚡ Command received — implementing now")
+    try:
+        sio.emit('cmdAck', {'instanceId': INSTANCE_ID,
+                            'users': data.get('users', 1),
+                            'meetingCode': data.get('meetingCode', '')})
+    except: pass
+
     if data.get('action') in ['terminate', 'terminate_all']:
         handle_terminate(data); return
 
@@ -466,7 +542,7 @@ def handle_command(data):
         BOTS_READY    = 0
         BOTS_FAILED   = 0
         READY_TO_JOIN = asyncio.Event()
-        PAGE_LOAD_SEM = asyncio.Semaphore(2)
+        PAGE_LOAD_SEM = asyncio.Semaphore(users)  # = batch size → ALL bots launch at once, no queueing
 
         tasks = [
             loop.create_task(
@@ -495,11 +571,30 @@ def handle_command(data):
         except: pass
 
     with bot_lock:
+        # Self-healing ghost counter
+        real_active = len(running_bots)
+        if real_active < current_bots:
+            current_bots = real_active
         if current_bots + users <= MAX_USERS_PER_INSTANCE:
             current_bots += users
             threading.Thread(target=run_automation, daemon=True).start()
         else:
-            sync_print(f"Capacity full ({current_bots}/{MAX_USERS_PER_INSTANCE})")
+            current_bots = len(running_bots)
+            if current_bots + users <= MAX_USERS_PER_INSTANCE:
+                current_bots += users
+                threading.Thread(target=run_automation, daemon=True).start()
+            else:
+                sync_print(f"Capacity full ({current_bots}/{MAX_USERS_PER_INSTANCE}) — rejecting {users}")
+                # Tell server this batch was rejected so dashboard can see it / retry
+                try:
+                    sio.emit('cmdRejected', {'instanceId': INSTANCE_ID,
+                                             'users': users,
+                                             'meetingCode': meeting_code,
+                                             'passcode': passcode,
+                                             'duration': duration,
+                                             'nameMode': name_mode,
+                                             'reason': f'capacity_full_{current_bots}/{MAX_USERS_PER_INSTANCE}'})
+                except: pass
 
 # ========== SOCKET EVENTS ==========
 _SHOULD_UNASSIGN = False
@@ -524,11 +619,9 @@ def disconnect():
 def handle_shutdown(_=None):
     sync_print("Shutdown signal received — unassigning Colab runtime...")
     try:
-        # Write trigger file — Cell 3 watcher picks it up
         with open('/content/SHUTDOWN_NOW', 'w') as f:
             f.write('1')
         sync_print("Shutdown trigger written")
-        # Also try direct call
         try:
             from google.colab import runtime
             runtime.unassign()
@@ -550,7 +643,7 @@ def heartbeat_loop():
             if sio.connected:
                 sio.emit('heartbeat', {'instanceId': INSTANCE_ID, 'currentUsers': current_bots})
         except: pass
-        time.sleep(5)
+        time.sleep(15)
 
 try:
     sio.connect(NGROK_URL, transports=['websocket', 'polling'])
@@ -562,11 +655,10 @@ except Exception as e:
 while True:
     time.sleep(1)
     if _SHOULD_UNASSIGN:
-        # Write a trigger file that Cell 3 watches
         try:
             with open('/content/unassign_trigger.txt', 'w') as f:
                 f.write('1')
             sync_print("Unassign trigger written — waiting for cell to pick up...")
         except Exception as e:
             sync_print(f"Trigger write error: {e}")
-        break  # Exit main loop so cell finishes and next cell can run
+        break
